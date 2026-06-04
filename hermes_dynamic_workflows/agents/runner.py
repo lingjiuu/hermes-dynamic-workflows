@@ -506,7 +506,7 @@ def _child_metadata(
         # how much each child reused vs wrote to the cache.
         "cache_read_tokens": _int_attr(child, "session_cache_read_tokens"),
         "cache_write_tokens": _int_attr(child, "session_cache_write_tokens"),
-        "tool_calls": _tool_call_count(child, result),
+        "tool_calls": _tool_call_count(result),
     }
     return metadata
 
@@ -516,21 +516,32 @@ def _int_attr(obj: Any, name: str) -> int:
     return int(value) if isinstance(value, (int, float)) else 0
 
 
-def _tool_call_count(child: Any, result: dict[str, Any]) -> int:
-    try:
-        summary = child.get_activity_summary()
-        value = summary.get("tool_call_count") or summary.get("api_call_count")
-        if isinstance(value, (int, float)):
-            return int(value)
-    except Exception:
-        pass
+def _tool_call_count(result: dict[str, Any]) -> int:
+    """Count actual tool invocations in the child's conversation.
+
+    Hermes' get_activity_summary() exposes api_call_count (LLM round-trips), not
+    a tool-call count, so it is not a valid source here — using it reported a
+    nonzero "tool calls" even for toolset=[] agents that just answered. Count
+    real tool calls from the result messages instead: OpenAI-style assistant
+    `tool_calls`, plus Anthropic-style `tool_use` content blocks.
+    """
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
         return 0
     count = 0
     for message in messages:
-        if isinstance(message, dict):
-            count += len(message.get("tool_calls") or [])
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            count += len(tool_calls)
+        content = message.get("content")
+        if isinstance(content, list):
+            count += sum(
+                1
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            )
     return count
 
 

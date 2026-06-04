@@ -13,6 +13,7 @@ from hermes_dynamic_workflows.agents.runner import (
     _child_failure_message,
     _make_child_approval_callback,
     _resolve_child_toolsets,
+    _tool_call_count,
 )
 from hermes_dynamic_workflows.engine.config import PluginConfig
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest
@@ -116,6 +117,38 @@ class ChildFailureDetectionTests(unittest.TestCase):
 
     def test_non_dict_result_is_not_a_failure(self):
         self.assertIsNone(_child_failure_message("nope", ""))
+
+
+class ToolCallCountTests(unittest.TestCase):
+    def test_counts_openai_tool_calls(self):
+        result = {
+            "messages": [
+                {"role": "assistant", "tool_calls": [{"id": "1"}, {"id": "2"}]},
+                {"role": "tool", "content": "x"},
+                {"role": "assistant", "content": "done"},
+            ]
+        }
+        self.assertEqual(_tool_call_count(result), 2)
+
+    def test_counts_anthropic_tool_use_blocks(self):
+        result = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hi"}, {"type": "tool_use", "name": "x"}],
+                }
+            ]
+        }
+        self.assertEqual(_tool_call_count(result), 1)
+
+    def test_no_tool_calls_is_zero_not_api_call_count(self):
+        # The bug: a toolset=[] agent makes an API call but no tool calls -> the
+        # count must be 0, not the api_call_count fallback.
+        result = {"messages": [{"role": "assistant", "content": "APPLE"}]}
+        self.assertEqual(_tool_call_count(result), 0)
+
+    def test_missing_messages_is_zero(self):
+        self.assertEqual(_tool_call_count({}), 0)
 
 
 class ConfigDefaultsTests(unittest.TestCase):
