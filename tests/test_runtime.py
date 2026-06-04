@@ -138,7 +138,13 @@ def workflow():
     )
 """
         runner = ResponseFormatFallbackRunner()
-        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+        result = run_workflow(
+            script,
+            WorkflowOptions(
+                config=PluginConfig(structured_output_mode="response_format"),
+                child_runner=runner,
+            ),
+        )
 
         self.assertEqual(result.value, {"ok": True})
         self.assertEqual(len(runner.requests), 2)

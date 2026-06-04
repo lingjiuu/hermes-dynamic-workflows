@@ -16,6 +16,7 @@ from .structured import (
     looks_like_response_format_error,
     parse_structured_output,
 )
+from .structured_tool import build_tool_schema_instruction
 from ..ui.display import preview
 from .errors import WorkflowRuntimeError
 from .types import AgentRecord, ChildAgentRequest, ChildAgentResult, WorkflowFrame
@@ -97,8 +98,14 @@ class WorkflowAPI:
             self.frame.agents.append(record)
             self._notify()
 
-        task_prompt = prompt + build_schema_instruction(schema) if schema else prompt
         structured_mode = self.config.structured_output_mode if schema else ""
+        use_tool_channel = bool(schema) and structured_mode in {"auto", "tool"}
+        if not schema:
+            task_prompt = prompt
+        elif use_tool_channel:
+            task_prompt = prompt + build_tool_schema_instruction(schema)
+        else:
+            task_prompt = prompt + build_schema_instruction(schema)
         request_overrides = _structured_request_overrides(schema, structured_mode, label, agent_id)
         fingerprint = agent_fingerprint(
             prompt,
@@ -140,11 +147,18 @@ class WorkflowAPI:
             isolation=isolation,
             cwd=self.frame.cwd,
             request_overrides=request_overrides,
+            structured_tool=use_tool_channel,
         )
         if schema:
+            if use_tool_channel:
+                structured_mode_label = "tool"
+            elif request_overrides:
+                structured_mode_label = "response_format"
+            else:
+                structured_mode_label = "prompt"
             record.structured = {
                 "status": "pending",
-                "mode": "response_format" if request_overrides else "prompt",
+                "mode": structured_mode_label,
                 "attempts": 0,
                 "repaired": False,
             }
@@ -160,7 +174,18 @@ class WorkflowAPI:
             _apply_child_metadata(record, metadata)
             self.context.record_tokens(record.tokens)
             if schema:
-                result = self._parse_or_repair_structured(result, schema, record, request)
+                if isinstance(metadata, dict) and metadata.get("structured_captured"):
+                    result = metadata.get("structured_result")
+                    record.structured.update(
+                        {
+                            "status": "valid",
+                            "mode": "tool",
+                            "attempts": int(metadata.get("structured_attempts") or 1),
+                            "error": "",
+                        }
+                    )
+                else:
+                    result = self._parse_or_repair_structured(result, schema, record, request)
             record.status = "done"
             record.result_preview = preview(result, 180)
             self.resume_cache.put(agent_id, fingerprint, result)
@@ -181,7 +206,7 @@ class WorkflowAPI:
         except Exception as exc:
             if (
                 request.request_overrides
-                and self.config.structured_output_mode == "auto"
+                and self.config.structured_output_mode == "response_format"
                 and looks_like_response_format_error(exc)
             ):
                 record.structured.update(
@@ -454,7 +479,7 @@ def _structured_request_overrides(
     label: str,
     agent_id: int,
 ) -> dict[str, Any] | None:
-    if not schema or mode not in {"auto", "response_format"}:
+    if not schema or mode != "response_format":
         return None
     return build_response_format_overrides(schema, name=f"workflow_agent_{agent_id}_{label}")
 

@@ -194,6 +194,7 @@ class ChildAgentRequest:
     isolation: str | None = None
     cwd: str | None = None
     request_overrides: dict[str, Any] | None = None
+    structured_tool: bool = False
 
 
 class ChildAgentRunner:

@@ -15,6 +15,10 @@ from ..engine.errors import WorkflowParseError
 
 RUN_ID_RE = re.compile(r"^wf_[a-z0-9-]{6,}$")
 
+# Names a saved workflow must not take, because they would shadow the plugin's
+# own slash commands / tool.
+_RESERVED_WORKFLOW_NAMES = frozenset({"workflows", "workflow-stop", "workflow"})
+
 
 @dataclass(frozen=True)
 class WorkflowSource:

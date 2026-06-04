@@ -106,6 +106,41 @@ def workflow():
         self.assertIn("1.2K tok", detail)
         self.assertIn("Saved workflow", saved)
 
+    def test_save_named_workflow_writes_reusable_script(self):
+        from hermes_dynamic_workflows.ui.commands import discover_named_workflows
+
+        script = """
+meta = {"name": "audit"}
+
+def workflow():
+    return agent("audit", {"label": "auditor"})
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = WorkflowStore(root / "store")
+            manager = WorkflowRunManager(store=store, config=PluginConfig())
+            with patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=CountingRunner()):
+                record = manager.start_from_params({"script": script}, cwd=str(root))
+                final = manager.wait(record["runId"], timeout=2)
+
+            project = manager.save_named_workflow(final["runId"], "repo-audit", scope="project", cwd=str(root))
+            user = manager.save_named_workflow(final["runId"], "user-audit", scope="user", cwd=str(root))
+            reserved = manager.save_named_workflow(final["runId"], "workflows", scope="project", cwd=str(root))
+
+            self.assertTrue(project["ok"])
+            self.assertEqual(project["name"], "repo-audit")
+            project_path = Path(project["path"])
+            self.assertEqual(project_path, root / ".hermes" / "workflows" / "repo-audit.py")
+            self.assertIn("def workflow()", project_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(user["ok"])
+            self.assertEqual(Path(user["path"]), store.workflows_dir / "user-audit.py")
+
+            self.assertFalse(reserved["ok"])
+
+            discovered = discover_named_workflows(str(root))
+            self.assertIn("repo-audit", discovered)
+
 
 if __name__ == "__main__":
     unittest.main()

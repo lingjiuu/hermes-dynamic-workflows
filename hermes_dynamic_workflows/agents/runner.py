@@ -15,6 +15,12 @@ from .presets import AgentTypeSpec, resolve_agent_type
 from .worktree import WorkspaceLease, create_workspace_lease
 from ..engine.config import PluginConfig
 from ..engine.errors import ChildAgentError, WorkflowTimeout
+from ..engine.structured_tool import (
+    STRUCTURED_OUTPUT_TOOLSET,
+    clear_expectation,
+    pop_result,
+    register_expectation,
+)
 from ..engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 
 
@@ -44,9 +50,25 @@ class HermesChildAgentRunner(ChildAgentRunner):
             request.toolsets,
             agent_type.toolsets if agent_type else (),
         )
+        structured_tool = bool(request.structured_tool and request.schema)
+        if structured_tool and STRUCTURED_OUTPUT_TOOLSET not in toolsets:
+            toolsets = toolsets + [STRUCTURED_OUTPUT_TOOLSET]
         _prepare_mcp_tool_registry(self.config)
         child = self._build_agent(request, runtime, toolsets, lease, agent_type)
-        return self._run_child_with_timeout(child, request, lease, agent_type, toolsets)
+        if structured_tool:
+            register_expectation(lease.task_id, request.schema)
+        try:
+            result = self._run_child_with_timeout(child, request, lease, agent_type, toolsets)
+            if structured_tool and isinstance(result, ChildAgentResult):
+                captured, value, attempts = pop_result(lease.task_id)
+                if captured:
+                    result.metadata["structured_captured"] = True
+                    result.metadata["structured_result"] = value
+                    result.metadata["structured_attempts"] = attempts
+            return result
+        finally:
+            if structured_tool:
+                clear_expectation(lease.task_id)
 
     def supports_request_overrides(self) -> bool:
         try:

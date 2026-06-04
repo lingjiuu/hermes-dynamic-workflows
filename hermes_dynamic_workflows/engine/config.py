@@ -34,6 +34,12 @@ class PluginConfig:
     allow_model_override: bool = False
     allow_provider_override: bool = False
     keep_worktrees: bool = False
+    # How agent(schema=...) constrains child output:
+    #   "auto"/"tool" -> child calls workflow_submit_structured_output, validated
+    #       at the tool layer with model retry (Claude-Code-style); falls back to
+    #       parsing the final message if the tool is never called.
+    #   "response_format" -> provider-native json_schema response_format override.
+    #   "prompt" -> instruction only, then parse the final message.
     structured_output_mode: str = "auto"
     structured_retries: int = 1
     structured_repair_with_llm: bool = True
@@ -177,7 +183,7 @@ def load_config() -> PluginConfig:
         structured_output_mode=_as_mode(
             raw.get("structured_output_mode"),
             default.structured_output_mode,
-            {"auto", "response_format", "prompt"},
+            {"auto", "tool", "response_format", "prompt"},
         ),
         structured_retries=_as_int(
             raw.get("structured_retries"),

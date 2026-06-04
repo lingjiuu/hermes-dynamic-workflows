@@ -166,6 +166,65 @@ class WorkflowRunManager:
         target.write_text(render_saved_markdown(run), encoding="utf-8")
         return f"Saved workflow {run_id} to {target}"
 
+    def save_named_workflow(
+        self,
+        run_id: str,
+        name: str,
+        *,
+        scope: str = "project",
+        cwd: str | None = None,
+    ) -> dict[str, Any]:
+        """Save a run's script as a reusable named workflow.
+
+        Writes to ``<cwd>/.hermes/workflows/<name>.py`` (project scope) or the
+        user store's ``workflows/<name>.py`` (user scope). Either location is
+        resolvable later by passing ``name`` to the workflow tool, and the
+        caller can register a ``/<name>`` slash command for it.
+        """
+        from ..storage.store import _RESERVED_WORKFLOW_NAMES, _safe_workflow_name
+
+        run = self.get(run_id)
+        if not run:
+            return {"ok": False, "message": f"Workflow run not found: {run_id}"}
+        script = self._load_run_script(run, run_id)
+        if not script:
+            return {"ok": False, "message": f"No saved script found for run {run_id}"}
+        try:
+            safe = _safe_workflow_name(name)
+        except ValueError as exc:
+            return {"ok": False, "message": str(exc)}
+        if safe in _RESERVED_WORKFLOW_NAMES:
+            return {"ok": False, "message": f"'{safe}' is reserved; choose another name"}
+
+        if scope == "user":
+            target = self.store.workflows_dir / f"{safe}.py"
+        else:
+            base = Path(cwd or run.get("cwd") or os.getcwd()).expanduser()
+            target = base / ".hermes" / "workflows" / f"{safe}.py"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(script, encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "message": f"Could not write {target}: {exc}"}
+        return {"ok": True, "name": safe, "path": str(target), "scope": scope}
+
+    def _load_run_script(self, run: dict[str, Any], run_id: str) -> str | None:
+        candidates: list[Path] = []
+        script_path = run.get("scriptPath")
+        if script_path:
+            candidates.append(Path(script_path))
+        try:
+            candidates.append(self.store.script_path(run_id))
+        except Exception:
+            pass
+        for candidate in candidates:
+            try:
+                if candidate and candidate.is_file():
+                    return candidate.read_text(encoding="utf-8")
+            except OSError:
+                continue
+        return None
+
     def wait(self, run_id: str, timeout: float | None = None) -> dict[str, Any] | None:
         with self._lock:
             managed = self._runs.get(run_id)
