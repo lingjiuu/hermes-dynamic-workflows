@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+from hermes_dynamic_workflows.engine.approval_hook import pre_tool_call_handler
 from hermes_dynamic_workflows.engine.structured_tool import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     STRUCTURED_OUTPUT_TOOL_SCHEMA,
@@ -48,6 +49,10 @@ def register(ctx) -> None:
         handler=submit_structured_output_handler,
         description="Submit a dynamic-workflow child agent's final schema-validated answer.",
     )
+    # Make child_approval_policy authoritative for workflow-child terminal
+    # commands even in non-CLI contexts (where Hermes would otherwise
+    # auto-approve/orphan). In CLI this defers to the per-thread callback.
+    ctx.register_hook("pre_tool_call", pre_tool_call_handler)
     ctx.register_command(
         name="workflows",
         handler=workflows_command,
