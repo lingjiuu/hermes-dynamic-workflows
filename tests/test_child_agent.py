@@ -118,6 +118,15 @@ class ChildFailureDetectionTests(unittest.TestCase):
         self.assertIsNone(_child_failure_message("nope", ""))
 
 
+class ConfigDefaultsTests(unittest.TestCase):
+    def test_model_override_on_provider_override_off_by_default(self):
+        # Aligns with Claude Code: per-agent model routing is allowed by default
+        # (session model unless a stage overrides); switching provider stays gated.
+        cfg = PluginConfig()
+        self.assertTrue(cfg.allow_model_override)
+        self.assertFalse(cfg.allow_provider_override)
+
+
 class ChildApprovalPolicyTests(unittest.TestCase):
     def test_deny_policy_refuses(self):
         cb = _make_child_approval_callback("deny")

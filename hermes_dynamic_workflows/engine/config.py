@@ -31,7 +31,12 @@ class PluginConfig:
         "messaging",
         "clarify",
     )
-    allow_model_override: bool = False
+    # Per-agent model override (agent(model=...)) is allowed by default, matching
+    # Claude Code's per-agent / per-stage model routing; the default is still the
+    # session model, override only when a stage wants a different tier. Provider
+    # override is a bigger surface (different endpoint/key/data flow), so it stays
+    # opt-in.
+    allow_model_override: bool = True
     allow_provider_override: bool = False
     keep_worktrees: bool = False
     # What a child agent does when Hermes' approval engine flags a command and
