@@ -1,0 +1,7 @@
+name: dynamic-workflows
+version: 0.1.0
+description: "Claude-Code-style dynamic workflow orchestration for Hermes."
+author: ""
+kind: standalone
+provides_tools:
+  - workflow

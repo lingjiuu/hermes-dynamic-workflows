@@ -1,0 +1,9 @@
+[project]
+name = "hermes-dynamic-workflows"
+version = "0.1.0"
+description = "Claude-Code-style dynamic workflows for Hermes Agent"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.unittest]
+start-dir = "tests"
