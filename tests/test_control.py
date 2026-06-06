@@ -10,11 +10,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from hermes_dynamic_workflows.engine.config import PluginConfig
+from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.engine.context import PauseGate
 from hermes_dynamic_workflows.engine.manager import WorkflowRunManager
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
-from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentRunner
+from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentRunner
 from hermes_dynamic_workflows.storage.control import ControlClient
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 

@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from .api import WorkflowAPI
 from .cache import ResumeCache
-from .config import PluginConfig, load_config
+from ..core.config import PluginConfig, load_config
 from .context import PauseGate, WorkflowExecutionContext
 from .sandbox import (
     ENTRYPOINT_NAME,
@@ -22,7 +22,7 @@ from .sandbox import (
     extract_meta,
     parse_script,
 )
-from .types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
+from ..core.types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
 
 
 @dataclass

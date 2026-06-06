@@ -10,13 +10,13 @@ from time import monotonic
 from typing import Any, Callable, Iterator
 
 from .cache import ResumeCache
-from .config import PluginConfig
-from .errors import (
+from ..core.config import PluginConfig
+from ..core.errors import (
     WorkflowDeadlineExceeded,
     WorkflowLimitExceeded,
     WorkflowStopped,
 )
-from .types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
+from ..core.types import ChildAgentRunner, WorkflowFrame, WorkflowState, normalize_phase_specs
 
 
 class PauseGate:

@@ -3,8 +3,8 @@ from __future__ import annotations
 import ast
 import unittest
 
-from hermes_dynamic_workflows.engine.config import PluginConfig
-from hermes_dynamic_workflows.engine.errors import SandboxViolation, WorkflowParseError
+from hermes_dynamic_workflows.core.config import PluginConfig
+from hermes_dynamic_workflows.core.errors import SandboxViolation, WorkflowParseError
 from hermes_dynamic_workflows.engine.sandbox import (
     LOOP_GUARD_NAME,
     extract_meta,

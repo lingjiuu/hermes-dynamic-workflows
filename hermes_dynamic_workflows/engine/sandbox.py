@@ -11,8 +11,8 @@ from __future__ import annotations
 import ast
 from typing import Any
 
-from .config import PluginConfig
-from .errors import SandboxViolation, WorkflowParseError
+from ..core.config import PluginConfig
+from ..core.errors import SandboxViolation, WorkflowParseError
 
 # We gate CAPABILITY (what a script can touch), not CONTROL FLOW (how it loops
 # or branches). while/try/raise are pure control flow — harmless on their own

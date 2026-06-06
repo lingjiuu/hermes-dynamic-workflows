@@ -113,7 +113,7 @@ def _is_interactive_cli() -> bool:
 
 def _config() -> Any:
     try:
-        from .config import load_config
+        from ..core.config import load_config
 
         return load_config()
     except Exception:

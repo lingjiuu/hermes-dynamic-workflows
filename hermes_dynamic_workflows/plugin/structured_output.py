@@ -7,7 +7,7 @@ from copy import deepcopy
 import threading
 from typing import Any, Callable, Iterable, Iterator
 
-from hermes_dynamic_workflows.engine.structured import validate_json_schema, validate_schema
+from hermes_dynamic_workflows.core.schema import validate_json_schema, validate_schema
 from hermes_dynamic_workflows.plugin.tool_errors import tool_error
 
 STRUCTURED_OUTPUT_TOOL_NAME = "structured_output"

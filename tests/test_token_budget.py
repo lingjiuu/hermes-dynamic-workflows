@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from hermes_dynamic_workflows.engine.token_budget import parse_token_budget
+from hermes_dynamic_workflows.core.token_budget import parse_token_budget
 
 
 class TokenBudgetParserTests(unittest.TestCase):

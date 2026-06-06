@@ -14,8 +14,8 @@ from typing import Any
 
 from .presets import AgentTypeSpec, list_agent_types, resolve_agent_type
 from .worktree import WorkspaceLease, create_workspace_lease
-from ..engine.config import PluginConfig
-from ..engine.errors import ChildAgentError, ChildAgentSkipped, WorkflowTimeout
+from ..core.config import PluginConfig
+from ..core.errors import ChildAgentError, ChildAgentSkipped, WorkflowTimeout
 from ..plugin.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
     STRUCTURED_OUTPUT_CONTINUE_MESSAGE,
@@ -28,7 +28,7 @@ from ..plugin.structured_output import (
     specialize_structured_output_tool,
     structured_output_tool_scope,
 )
-from ..engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
+from ..core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 
 logger = logging.getLogger(__name__)
 

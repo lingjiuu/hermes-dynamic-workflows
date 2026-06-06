@@ -12,7 +12,7 @@ from pathlib import Path
 from tempfile import gettempdir
 from typing import Any
 
-from ..engine.errors import WorkflowParseError
+from ..core.errors import WorkflowParseError
 
 RUN_ID_RE = re.compile(r"^wf_[a-z0-9-]{6,}$")
 

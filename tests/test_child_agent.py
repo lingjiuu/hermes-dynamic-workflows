@@ -23,9 +23,9 @@ from hermes_dynamic_workflows.agent.runner import (
     _tool_call_count,
 )
 from hermes_dynamic_workflows.agent.worktree import WorkspaceLease
-from hermes_dynamic_workflows.engine.config import PluginConfig
-from hermes_dynamic_workflows.engine.errors import ChildAgentError
-from hermes_dynamic_workflows.engine.types import ChildAgentRequest
+from hermes_dynamic_workflows.core.config import PluginConfig
+from hermes_dynamic_workflows.core.errors import ChildAgentError
+from hermes_dynamic_workflows.core.types import ChildAgentRequest
 from hermes_dynamic_workflows.plugin.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
     STRUCTURED_OUTPUT_CONTINUE_MESSAGE,

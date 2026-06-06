@@ -13,8 +13,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-from hermes_dynamic_workflows.engine.config import PluginConfig
-from hermes_dynamic_workflows.engine.errors import WorkflowRuntimeError
+from hermes_dynamic_workflows.core.config import PluginConfig
+from hermes_dynamic_workflows.core.errors import WorkflowRuntimeError
 from hermes_dynamic_workflows.engine import manager as manager_module
 from hermes_dynamic_workflows.engine.manager import (
     LiveTranscriptExporter,
@@ -23,7 +23,7 @@ from hermes_dynamic_workflows.engine.manager import (
     _capture_parent_runtime,
     _gateway_running_agent,
 )
-from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
+from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 
 

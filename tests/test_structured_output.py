@@ -5,10 +5,10 @@ import json
 import unittest
 from unittest.mock import patch
 
-from hermes_dynamic_workflows.engine.config import PluginConfig
+from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
-from hermes_dynamic_workflows.engine.structured import StructuredOutputError, validate_json_schema
-from hermes_dynamic_workflows.engine.types import (
+from hermes_dynamic_workflows.core.schema import StructuredOutputError, validate_json_schema
+from hermes_dynamic_workflows.core.types import (
     ChildAgentRequest,
     ChildAgentResult,
     ChildAgentRunner,
