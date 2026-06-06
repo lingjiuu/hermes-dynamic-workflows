@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from hermes_dynamic_workflows.plugin_entrypoint import register
+from hermes_dynamic_workflows.entry import register
 
 __all__ = ["register"]

@@ -16,7 +16,7 @@ def __getattr__(name: str):
 
         return getattr(runtime, name)
     if name == "workflow":
-        from .plugin.workflow import workflow
+        from .adapters.workflow import workflow
 
         return workflow
     raise AttributeError(name)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from hermes_dynamic_workflows.engine.approval_hook import (
+from hermes_dynamic_workflows.adapters.hooks import (
     evaluate_command_gate,
     pre_tool_call_handler,
 )
@@ -157,7 +157,7 @@ class InheritResolutionTests(unittest.TestCase):
         appr._get_approval_mode = lambda: mode
         pkg = types.ModuleType("tools")
         pkg.approval = appr
-        from hermes_dynamic_workflows.engine.approval_hook import _resolve_policy
+        from hermes_dynamic_workflows.adapters.hooks import _resolve_policy
 
         class _Cfg:
             child_approval_policy = "inherit"
@@ -175,7 +175,7 @@ class InheritResolutionTests(unittest.TestCase):
         self.assertEqual(self._resolve("off"), "approve")
 
     def test_non_inherit_passes_through(self):
-        from hermes_dynamic_workflows.engine.approval_hook import _resolve_policy
+        from hermes_dynamic_workflows.adapters.hooks import _resolve_policy
 
         class _Cfg:
             child_approval_policy = "deny"

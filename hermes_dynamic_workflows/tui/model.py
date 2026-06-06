@@ -81,7 +81,7 @@ class WorkflowRepository:
         return [workflow_view(run, jsonl_reader=self._jsonl_reader) for run in self.store.list_runs(limit=limit)]
 
     def save_markdown(self, workflow: WorkflowView) -> Path:
-        from ..ui.display import render_saved_markdown
+        from ..view.render import render_saved_markdown
 
         path = self.store.exports_dir / f"{workflow.run_id}.md"
         path.parent.mkdir(parents=True, exist_ok=True)

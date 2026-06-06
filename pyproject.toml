@@ -12,7 +12,7 @@ dependencies = [
 hermes-workflows = "hermes_dynamic_workflows.tui.app:main"
 
 [project.entry-points."hermes_agent.plugins"]
-dynamic-workflows = "hermes_dynamic_workflows.plugin_entrypoint"
+dynamic-workflows = "hermes_dynamic_workflows.entry"
 
 [tool.setuptools.package-data]
 hermes_dynamic_workflows = ["agents/*.md"]

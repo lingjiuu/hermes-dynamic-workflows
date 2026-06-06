@@ -26,7 +26,7 @@ from ..storage.store import (
     utc_now_iso,
 )
 from ..storage.control import ControlListener, new_control_owner
-from ..ui.display import (
+from ..view.render import (
     render_agent_overview,
     render_saved_markdown,
     render_workflow_text,

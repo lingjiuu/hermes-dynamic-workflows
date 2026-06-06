@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from hermes_dynamic_workflows.ui.display import render_agent_overview, render_workflow_text
+from hermes_dynamic_workflows.view.render import render_agent_overview, render_workflow_text
 
 
 class DisplayTests(unittest.TestCase):

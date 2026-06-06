@@ -12,8 +12,8 @@ from unittest.mock import patch
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.engine.manager import WorkflowRunManager
 from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentRunner
-from hermes_dynamic_workflows.plugin.task_stop import task_stop
-from hermes_dynamic_workflows.plugin.workflow import (
+from hermes_dynamic_workflows.adapters.task_stop import task_stop
+from hermes_dynamic_workflows.adapters.workflow import (
     DYNAMIC_WORKFLOW_SCHEMA,
     get_dynamic_workflow_schema,
     workflow,
@@ -85,7 +85,7 @@ return budget.total
                 config=PluginConfig(require_launch_approval=False),
             )
             with (
-                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager),
                 patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=FakeRunner()),
             ):
                 with_budget = workflow(
@@ -130,7 +130,7 @@ return await agent("do it", {"label": "worker"})
                 config=PluginConfig(require_launch_approval=False),
             )
             with (
-                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager),
                 patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=FakeRunner()),
             ):
                 result = workflow({"script": script, "args": ["x"]}, task_id="tool-session")
@@ -183,7 +183,7 @@ return await agent("do it", {"label": "worker"})
                 config=PluginConfig(require_launch_approval=False),
             )
             with (
-                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager),
                 patch(
                     "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                     side_effect=runner_factory,
@@ -221,8 +221,8 @@ return await agent("wait", {"label": "worker"})
                 config=PluginConfig(require_launch_approval=False),
             )
             with (
-                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
-                patch("hermes_dynamic_workflows.plugin.task_stop.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.adapters.task_stop.get_run_manager", return_value=manager),
                 patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=runner),
             ):
                 launch = workflow({"script": script}, task_id="tool-session")
@@ -259,7 +259,7 @@ return await agent("wait", {"label": "worker"})
                 store=WorkflowStore(Path(tmp)),
                 config=PluginConfig(require_launch_approval=False),
             )
-            with patch("hermes_dynamic_workflows.plugin.task_stop.get_run_manager", return_value=manager):
+            with patch("hermes_dynamic_workflows.adapters.task_stop.get_run_manager", return_value=manager):
                 missing = task_stop({})
                 unknown = task_stop({"task_id": "wgunknown"})
 
@@ -285,7 +285,7 @@ return await agent("wait", {"label": "worker"})
                 config=PluginConfig(require_launch_approval=False),
             )
             with (
-                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager),
                 patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=runner),
             ):
                 launch = workflow({"script": script}, task_id="tool-session")
@@ -324,7 +324,7 @@ return await agent("wait", {"label": "worker"})
                 store=WorkflowStore(Path(tmp)),
                 config=PluginConfig(require_launch_approval=False),
             )
-            with patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager):
+            with patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager):
                 result = workflow({"script": "return 1"}, task_id="tool-session")
 
         self.assertEqual(
