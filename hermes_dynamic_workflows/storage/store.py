@@ -205,9 +205,9 @@ def default_store_root() -> Path:
     if override:
         return Path(override).expanduser()
     try:
-        from hermes_constants import get_hermes_home
+        from ..host import session as host_session
 
-        return Path(get_hermes_home()) / "dynamic-workflows"
+        return Path(host_session.hermes_home()) / "dynamic-workflows"
     except Exception:
         return Path.home() / ".hermes" / "dynamic-workflows"
 
@@ -217,9 +217,9 @@ def default_layout_root() -> Path:
     if override:
         return Path(override).expanduser()
     try:
-        from hermes_constants import get_hermes_home
+        from ..host import session as host_session
 
-        return Path(get_hermes_home())
+        return Path(host_session.hermes_home())
     except Exception:
         return Path.home() / ".hermes"
 

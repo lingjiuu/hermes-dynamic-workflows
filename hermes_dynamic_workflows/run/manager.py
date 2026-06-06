@@ -831,9 +831,9 @@ def _gateway_running_agent() -> Any:
     if not session_key:
         return None
     try:
-        from gateway.run import _gateway_runner_ref
+        from ..host import gateway as host_gateway
 
-        runner = _gateway_runner_ref()
+        runner = host_gateway.gateway_runner_ref()
         if runner is None:
             return None
         running = getattr(runner, "_running_agents", None)
@@ -852,9 +852,9 @@ def _gateway_running_agent() -> Any:
 
 def _get_hermes_session_env(name: str) -> str:
     try:
-        from gateway.session_context import get_session_env
+        from ..host import gateway as host_gateway
 
-        return str(get_session_env(name, "") or "").strip()
+        return str(host_gateway.raw_session_env(name, "") or "").strip()
     except Exception:
         return os.getenv(name, "").strip()
 
@@ -931,11 +931,12 @@ def _capture_gateway_session_context() -> dict[str, str] | None:
     re-apply them and route a flagged command to the originating user for
     mid-run approval (child_approval_policy="ask").
     """
+    from ..host import gateway as host_gateway
+
     try:
-        from gateway.session_context import get_session_env
+        platform = host_gateway.raw_session_env("HERMES_SESSION_PLATFORM", "")
     except Exception:
         return None
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
     if not platform:
         return None  # not a gateway session
     keys = {
@@ -947,7 +948,7 @@ def _capture_gateway_session_context() -> dict[str, str] | None:
         "user_name": "HERMES_SESSION_USER_NAME",
         "session_key": "HERMES_SESSION_KEY",
     }
-    return {field: get_session_env(env, "") for field, env in keys.items()}
+    return {field: host_gateway.raw_session_env(env, "") for field, env in keys.items()}
 
 
 def _notify_completion(plugin_context: Any, record: dict[str, Any], config: PluginConfig) -> None:

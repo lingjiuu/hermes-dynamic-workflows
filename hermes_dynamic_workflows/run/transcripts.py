@@ -70,9 +70,9 @@ class SessionTranscriptReader:
         self._has_active_column = False
         if self._db is None:
             try:
-                from hermes_state import SessionDB
+                from ..host import session as host_session
 
-                self._db = SessionDB()
+                self._db = host_session.create_session_db()
             except Exception as exc:
                 self._incremental_reason = f"SessionDB unavailable: {type(exc).__name__}: {exc}"
         if self._db is not None and self._incremental_reason is None:
@@ -637,9 +637,9 @@ def _append_unique(items: Any, value: str) -> None:
 
 def _load_session_messages(session_id: str) -> list[dict[str, Any]]:
     try:
-        from hermes_state import SessionDB
+        from ..host import session as host_session
 
-        return SessionDB().get_messages(session_id, include_inactive=True)
+        return host_session.create_session_db().get_messages(session_id, include_inactive=True)
     except Exception:
         return []
 

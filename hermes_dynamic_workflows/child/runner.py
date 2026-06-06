@@ -297,9 +297,9 @@ class HermesChildAgentRunner(ChildAgentRunner):
             # a flagged command to the originating user for mid-run approval.
             if self._session_context:
                 try:
-                    from gateway.session_context import set_session_vars
+                    from ..host import gateway as host_gateway
 
-                    set_session_vars(**self._session_context)
+                    host_gateway.set_session_vars(**self._session_context)
                 except Exception:
                     pass
 
@@ -647,9 +647,9 @@ def _prepare_mcp_tool_registry(config: PluginConfig) -> None:
 
 def _create_session_db():
     try:
-        from hermes_state import SessionDB
+        from ..host import session as host_session
 
-        return SessionDB()
+        return host_session.create_session_db()
     except Exception:
         return None
 
