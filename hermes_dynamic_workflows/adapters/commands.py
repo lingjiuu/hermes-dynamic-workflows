@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..engine.manager import get_run_manager
+from ..run.manager import get_run_manager
 
 
 def workflows_command(raw_args: str = "") -> str:

@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from hermes_dynamic_workflows.core.config import PluginConfig
-from hermes_dynamic_workflows.engine.manager import _approve_launch
+from hermes_dynamic_workflows.run.manager import _approve_launch
 
 META = {"name": "demo", "description": "a workflow"}
 

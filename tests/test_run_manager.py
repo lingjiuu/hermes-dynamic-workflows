@@ -15,10 +15,13 @@ from unittest.mock import patch
 
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.core.errors import WorkflowRuntimeError
-from hermes_dynamic_workflows.engine import manager as manager_module
-from hermes_dynamic_workflows.engine.manager import (
+from hermes_dynamic_workflows.run import manager as manager_module
+from hermes_dynamic_workflows.run import transcripts as transcripts_module
+from hermes_dynamic_workflows.run.transcripts import (
     LiveTranscriptExporter,
     SessionTranscriptReader,
+)
+from hermes_dynamic_workflows.run.manager import (
     WorkflowRunManager,
     _capture_parent_runtime,
     _gateway_running_agent,
@@ -102,7 +105,7 @@ class ParentRuntimeTests(unittest.TestCase):
         )
 
         with patch(
-            "hermes_dynamic_workflows.engine.manager._gateway_running_agent",
+            "hermes_dynamic_workflows.run.manager._gateway_running_agent",
             return_value=parent,
         ):
             runtime = _capture_parent_runtime(None)
@@ -125,7 +128,7 @@ class ParentRuntimeTests(unittest.TestCase):
 
         with (
             patch(
-                "hermes_dynamic_workflows.engine.manager._get_hermes_session_env",
+                "hermes_dynamic_workflows.run.manager._get_hermes_session_env",
                 return_value="gateway-key",
             ),
             patch.dict(
@@ -742,7 +745,7 @@ return await agent("do it", {"label": "worker"})
                 "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                 return_value=runner,
             ), patch(
-                "hermes_dynamic_workflows.engine.manager._load_session_messages",
+                "hermes_dynamic_workflows.run.transcripts._load_session_messages",
                 side_effect=lambda session_id: list(fake_messages),
             ):
                 rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())
@@ -784,7 +787,7 @@ return await agent("do it", {"label": "worker"})
                 reader=reader,
             )
             with patch(
-                "hermes_dynamic_workflows.engine.manager._write_agent_transcript_files",
+                "hermes_dynamic_workflows.run.transcripts._write_agent_transcript_files",
             ) as write_files:
                 exporter.start()
                 for session_id in ("child-a", "child-b"):
@@ -937,15 +940,15 @@ return await agent("do it", {"label": "worker"})
     def test_live_transcript_append_uses_single_os_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "agent-child.jsonl"
-            original_write = manager_module.os.write
+            original_write = transcripts_module.os.write
             write_lengths: list[int] = []
 
             def record_write(fd, payload):
                 write_lengths.append(len(payload))
                 return original_write(fd, payload)
 
-            with patch("hermes_dynamic_workflows.engine.manager.os.write", side_effect=record_write):
-                manager_module._append_agent_transcript_messages(
+            with patch("hermes_dynamic_workflows.run.transcripts.os.write", side_effect=record_write):
+                transcripts_module._append_agent_transcript_messages(
                     path,
                     [
                         {"role": "user", "content": "first"},
@@ -1037,8 +1040,8 @@ return await agent("do it", {"label": "worker"})
         stats_lock = threading.Lock()
         rebuild_writes: Counter[str] = Counter()
         append_writes: Counter[str] = Counter()
-        original_write = manager_module._write_agent_transcript_files
-        original_append = manager_module._append_agent_transcript_messages
+        original_write = transcripts_module._write_agent_transcript_files
+        original_append = transcripts_module._append_agent_transcript_messages
 
         def write_files(path, meta_path, *, metadata, messages):
             with stats_lock:
@@ -1080,10 +1083,10 @@ return await agent("do it", {"label": "worker"})
                 )
 
             with patch(
-                "hermes_dynamic_workflows.engine.manager._write_agent_transcript_files",
+                "hermes_dynamic_workflows.run.transcripts._write_agent_transcript_files",
                 side_effect=write_files,
             ), patch(
-                "hermes_dynamic_workflows.engine.manager._append_agent_transcript_messages",
+                "hermes_dynamic_workflows.run.transcripts._append_agent_transcript_messages",
                 side_effect=append_messages,
             ):
                 exporter.start()
@@ -1159,7 +1162,7 @@ return await agent("do it", {"label": "worker"})
                 "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                 return_value=TranscriptRunner(),
             ), patch(
-                "hermes_dynamic_workflows.engine.manager._load_session_messages",
+                "hermes_dynamic_workflows.run.transcripts._load_session_messages",
                 return_value=fake_messages,
             ):
                 rec = manager.start_from_params({"script": script}, cwd=str(root), plugin_context=RecordingCtx())

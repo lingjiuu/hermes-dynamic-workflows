@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.engine.context import PauseGate
-from hermes_dynamic_workflows.engine.manager import WorkflowRunManager
+from hermes_dynamic_workflows.run.manager import WorkflowRunManager
 from hermes_dynamic_workflows.engine.runtime import WorkflowOptions, run_workflow
 from hermes_dynamic_workflows.core.types import ChildAgentRequest, ChildAgentRunner
 from hermes_dynamic_workflows.storage.control import ControlClient
@@ -173,7 +173,7 @@ class ControlTests(unittest.TestCase):
                         return_value=runner,
                     ),
                     patch(
-                        "hermes_dynamic_workflows.engine.manager._capture_gateway_session_context",
+                        "hermes_dynamic_workflows.run.manager._capture_gateway_session_context",
                         return_value={"platform": "telegram", "session_key": "gateway-session"},
                     ) as capture_context,
                 ):
@@ -348,7 +348,7 @@ result = await agent("work", {"label": "worker"})
     def test_control_listener_failure_does_not_block_workflow_launch(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                "hermes_dynamic_workflows.engine.manager.ControlListener.start",
+                "hermes_dynamic_workflows.run.manager.ControlListener.start",
                 side_effect=OSError("read-only control directory"),
             ):
                 manager = WorkflowRunManager(
