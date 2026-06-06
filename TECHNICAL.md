@@ -140,18 +140,19 @@ Workflow scripts must be deterministic: current time and randomness are unavaila
 Workflow <runId> is still running (task <taskId>). Stop it first with task_stop({"task_id":"<taskId>"}) before resuming.
 ```
 
-启动审批未通过会返回**带 trace** 的错误（`WorkflowLaunchDenied` 未并入上面的
-`tool_error` 分支）：
+启动审批未通过同样走 `tool_error`（干净，无 trace）：
 
 ```json
-{"error": "WorkflowLaunchDenied: Workflow \"<name>\" was not launched: <reason>. Do not retry; tell the user it needs their approval.", "trace": "<最后 8 行回溯>"}
+{"error":"Workflow \"<name>\" was not launched: <reason>. Do not retry; tell the user it needs their approval."}
 ```
 
 `<reason>` 取自审批环节，常见：`workflow launch was denied`、`workflow launch was
 denied or timed out`、`launch approval required but no interactive channel (…)`、
 `launch approval required but Hermes' approval engine is unavailable`。
 
-其它未预期异常：`{"error":"<Type>: <msg>","trace":"<最后 8 行回溯>"}`。
+其它**未预期**异常（真正的内部错误）才返回带 trace 的诊断信息——`trace` 是
+`traceback.format_exc` 的最后 8 行（文件路径、行号、出错代码），随工具结果一并对模型
+可见，便于报告：`{"error":"<Type>: <msg>","trace":"<最后 8 行回溯>"}`。
 
 **完成通知。** run 进入终态后（仅 CLI）注入：
 

@@ -72,6 +72,26 @@ Review code carefully.
         )
         self.assertNotIn("- none discovered", schema["description"])
 
+    def test_denied_launch_returns_clean_tool_error_without_trace(self):
+        # A denied top-level launch is expected control flow, not an internal
+        # bug — it must return a clean tool_error (no Python traceback leaked).
+        script = 'meta = {"name": "denied", "description": "Test workflow"}\n\nreturn 1\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(require_launch_approval=True),
+            )
+            with (
+                patch("hermes_dynamic_workflows.adapters.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.run.manager._approve_launch", return_value=(False, "test denied")),
+            ):
+                result = workflow({"script": script}, task_id="tool-session")
+        payload = json.loads(result)
+        self.assertNotIn("trace", payload)
+        self.assertNotIn("WorkflowLaunchDenied", payload["error"])
+        self.assertIn("was not launched", payload["error"])
+        self.assertIn("test denied", payload["error"])
+
     def test_tool_parses_budget_only_from_user_task(self):
         script = """
 meta = {"name": "budget-source", "description": "Test workflow"}

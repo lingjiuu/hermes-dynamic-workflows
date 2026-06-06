@@ -9,7 +9,12 @@ import traceback
 from typing import Any
 
 from ..child.presets import list_agent_types
-from ..core.errors import SandboxViolation, WorkflowParseError, WorkflowToolUseError
+from ..core.errors import (
+    SandboxViolation,
+    WorkflowLaunchDenied,
+    WorkflowParseError,
+    WorkflowToolUseError,
+)
 from ..run.manager import get_run_manager
 from ..core.tool_errors import tool_error
 
@@ -26,7 +31,15 @@ def workflow(params: dict[str, Any], *, plugin_context: Any = None, **kwargs: An
             user_task=kwargs.get("user_task"),
         )
         return _launch_message(record)
-    except (WorkflowParseError, SandboxViolation, WorkflowToolUseError) as exc:
+    except (
+        WorkflowParseError,
+        SandboxViolation,
+        WorkflowToolUseError,
+        WorkflowLaunchDenied,
+    ) as exc:
+        # Expected outcomes (bad script, denied launch, resume conflict) return a
+        # clean tool_error. Only genuinely unexpected exceptions fall through to
+        # the trace-bearing branch below.
         return tool_error(str(exc))
     except Exception as exc:
         return json.dumps(
