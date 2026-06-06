@@ -9,15 +9,26 @@ from unittest.mock import patch
 
 from hermes_dynamic_workflows.agents.presets import AgentTypeSpec, resolve_agent_type
 from hermes_dynamic_workflows.agents.runner import (
+    HermesChildAgentRunner,
     build_child_system_prompt,
     build_child_task_message,
     _child_failure_message,
+    _apply_agent_type_defaults,
     _make_child_approval_callback,
     _resolve_child_toolsets,
     _tool_call_count,
 )
+from hermes_dynamic_workflows.agents.worktree import WorkspaceLease
 from hermes_dynamic_workflows.engine.config import PluginConfig
+from hermes_dynamic_workflows.engine.errors import ChildAgentError
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest
+from hermes_dynamic_workflows.plugin.structured_output import (
+    MAX_STRUCTURED_OUTPUT_RETRIES,
+    STRUCTURED_OUTPUT_CONTINUE_MESSAGE,
+    clear_expectation,
+    register_expectation,
+    structured_output_handler,
+)
 
 
 class ChildAgentTests(unittest.TestCase):
@@ -46,6 +57,27 @@ class ChildAgentTests(unittest.TestCase):
         )
         self.assertIn("Agent type: researcher", prompt)
         self.assertIn("Search broadly", prompt)
+
+    def test_agent_type_applies_model_and_isolation_defaults(self):
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+        )
+        spec = AgentTypeSpec(
+            name="researcher",
+            instructions="Search.",
+            source="test",
+            model="test-model",
+            isolation="worktree",
+        )
+
+        applied = _apply_agent_type_defaults(request, spec)
+
+        self.assertEqual(applied.model, "test-model")
+        self.assertEqual(applied.isolation, "worktree")
 
     def test_system_prompt_excludes_per_task_data_for_cache_sharing(self):
         # The system prompt must depend only on agent_type (not label/phase/
@@ -167,13 +199,119 @@ class RunnerSessionContextTests(unittest.TestCase):
         self.assertIsNone(HermesChildAgentRunner(PluginConfig())._session_context)
 
 
+class StructuredOutputContinuationTests(unittest.TestCase):
+    def test_runner_continues_same_child_session_until_tool_submission(self):
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        request = ChildAgentRequest(
+            id=1,
+            prompt="return status",
+            label="json",
+            phase=None,
+            toolsets=[],
+            schema=schema,
+            structured_tool=True,
+        )
+        lease = WorkspaceLease(task_id="structured-child", cwd="/tmp")
+
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.calls = []
+                self.messages = [{"role": "assistant", "content": "done"}]
+
+            def run_conversation(self, *, user_message, conversation_history=None, task_id=None):
+                self.calls.append((user_message, conversation_history, task_id))
+                if len(self.calls) == 2:
+                    structured_output_handler({"ok": True}, task_id=task_id)
+                return {
+                    "final_response": "done",
+                    "messages": self.messages,
+                    "completed": True,
+                }
+
+        child = Child()
+        register_expectation(lease.task_id, schema)
+        try:
+            result = HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+                child,
+                request,
+                lease,
+                None,
+                ["workflow_structured"],
+            )
+        finally:
+            clear_expectation(lease.task_id)
+
+        self.assertEqual(result.content, "done")
+        self.assertEqual(len(child.calls), 2)
+        self.assertEqual(child.calls[1][0], STRUCTURED_OUTPUT_CONTINUE_MESSAGE)
+        self.assertIs(child.calls[1][1], child.messages)
+        self.assertEqual(child.calls[0][2], lease.task_id)
+        self.assertEqual(child.calls[1][2], lease.task_id)
+
+    def test_runner_fails_after_maximum_missing_submissions(self):
+        schema = {"type": "object"}
+        request = ChildAgentRequest(
+            id=1,
+            prompt="return status",
+            label="json",
+            phase=None,
+            toolsets=[],
+            schema=schema,
+            structured_tool=True,
+        )
+        lease = WorkspaceLease(task_id="structured-child-fail", cwd="/tmp")
+
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.calls = 0
+
+            def run_conversation(self, **_):
+                self.calls += 1
+                return {"final_response": "done", "messages": [], "completed": True}
+
+        child = Child()
+        register_expectation(lease.task_id, schema)
+        try:
+            with self.assertRaises(ChildAgentError) as ctx:
+                HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+                    child,
+                    request,
+                    lease,
+                    None,
+                    ["workflow_structured"],
+                )
+        finally:
+            clear_expectation(lease.task_id)
+
+        self.assertIn("Failed to provide valid structured output", str(ctx.exception))
+        self.assertEqual(child.calls, MAX_STRUCTURED_OUTPUT_RETRIES)
+
+
 class ConfigDefaultsTests(unittest.TestCase):
-    def test_model_override_on_provider_override_off_by_default(self):
+    def test_model_override_is_allowed_by_default(self):
         # Aligns with Claude Code: per-agent model routing is allowed by default
-        # (session model unless a stage overrides); switching provider stays gated.
+        # (session model unless a stage overrides). Provider selection stays in
+        # Hermes' runtime/model configuration, not workflow scripts.
         cfg = PluginConfig()
         self.assertTrue(cfg.allow_model_override)
-        self.assertFalse(cfg.allow_provider_override)
 
 
 class ChildApprovalPolicyTests(unittest.TestCase):

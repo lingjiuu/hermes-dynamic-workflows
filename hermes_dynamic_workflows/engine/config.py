@@ -23,7 +23,6 @@ class PluginConfig:
     workflow_timeout_seconds: float = 900.0
     child_timeout_seconds: float = 300.0
     script_max_chars: int = 524288
-    token_budget_total: int | None = None
     mcp_discovery_wait_seconds: float = 0.75
     default_child_toolsets: tuple[str, ...] = ("web", "file", "terminal")
     blocked_child_toolsets: tuple[str, ...] = (
@@ -38,10 +37,8 @@ class PluginConfig:
     # Per-agent model override (agent(model=...)) is allowed by default, matching
     # Claude Code's per-agent / per-stage model routing; the default is still the
     # session model, override only when a stage wants a different tier. Provider
-    # override is a bigger surface (different endpoint/key/data flow), so it stays
-    # opt-in.
+    # selection stays in Hermes' runtime/model configuration.
     allow_model_override: bool = True
-    allow_provider_override: bool = False
     keep_worktrees: bool = False
     # Ask the user to approve before a top-level workflow launches (CC gates
     # every launch — a run can spawn many agents and spend real tokens). On by
@@ -71,22 +68,12 @@ class PluginConfig:
     # What `ask` falls back to when no human is reachable (the common case for a
     # detached workflow child). smart | deny | approve.
     ask_fallback: str = "smart"
-    # How agent(schema=...) constrains child output:
-    #   "auto"/"tool" -> child calls workflow_submit_structured_output, validated
-    #       at the tool layer with model retry (Claude-Code-style); falls back to
-    #       parsing the final message if the tool is never called.
-    #   "response_format" -> provider-native json_schema response_format override.
-    #   "prompt" -> instruction only, then parse the final message.
     # On run completion, inject a <task-notification> into the conversation (via
     # ctx.inject_message) so the model can deliver the result without the user
     # polling /workflows. CLI-only (no-op in gateway). Result is truncated to
     # notify_result_preview_chars to protect context.
     notify_on_complete: bool = True
     notify_result_preview_chars: int = 2000
-    structured_output_mode: str = "auto"
-    structured_retries: int = 1
-    structured_repair_with_llm: bool = True
-    structured_raw_preview_chars: int = 2000
 
 
 def _as_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
@@ -125,19 +112,6 @@ def _as_str_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
         return default
     cleaned = tuple(item for item in items if item)
     return cleaned or default
-
-
-def _as_optional_int(value: Any, *, minimum: int = 1, maximum: int | None = None) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    parsed = max(minimum, parsed)
-    if maximum is not None:
-        parsed = min(maximum, parsed)
-    return parsed
 
 
 def _as_mode(value: Any, default: str, allowed: set[str]) -> str:
@@ -202,10 +176,6 @@ def load_config() -> PluginConfig:
             minimum=1000,
             maximum=1048576,
         ),
-        token_budget_total=_as_optional_int(
-            os.getenv("HERMES_DYNAMIC_WORKFLOWS_TOKEN_BUDGET", raw.get("token_budget_total")),
-            minimum=1,
-        ),
         mcp_discovery_wait_seconds=_as_float(
             raw.get("mcp_discovery_wait_seconds"),
             default.mcp_discovery_wait_seconds,
@@ -222,10 +192,6 @@ def load_config() -> PluginConfig:
         allow_model_override=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_ALLOW_MODEL_OVERRIDE", raw.get("allow_model_override")),
             default.allow_model_override,
-        ),
-        allow_provider_override=_as_bool(
-            os.getenv("HERMES_DYNAMIC_WORKFLOWS_ALLOW_PROVIDER_OVERRIDE", raw.get("allow_provider_override")),
-            default.allow_provider_override,
         ),
         keep_worktrees=_as_bool(
             os.getenv("HERMES_DYNAMIC_WORKFLOWS_KEEP_WORKTREES", raw.get("keep_worktrees")),
@@ -256,27 +222,6 @@ def load_config() -> PluginConfig:
             raw.get("notify_result_preview_chars"),
             default.notify_result_preview_chars,
             minimum=0,
-            maximum=20000,
-        ),
-        structured_output_mode=_as_mode(
-            raw.get("structured_output_mode"),
-            default.structured_output_mode,
-            {"auto", "tool", "response_format", "prompt"},
-        ),
-        structured_retries=_as_int(
-            raw.get("structured_retries"),
-            default.structured_retries,
-            minimum=0,
-            maximum=1,
-        ),
-        structured_repair_with_llm=_as_bool(
-            raw.get("structured_repair_with_llm"),
-            default.structured_repair_with_llm,
-        ),
-        structured_raw_preview_chars=_as_int(
-            raw.get("structured_raw_preview_chars"),
-            default.structured_raw_preview_chars,
-            minimum=200,
             maximum=20000,
         ),
     )

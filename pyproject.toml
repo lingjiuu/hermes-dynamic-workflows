@@ -3,7 +3,12 @@ name = "hermes-dynamic-workflows"
 version = "0.1.0"
 description = "Claude-Code-style dynamic workflows for Hermes Agent"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "jsonschema>=4,<5",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+dynamic-workflows = "hermes_dynamic_workflows.plugin_entrypoint"
 
 [tool.unittest]
 start-dir = "tests"

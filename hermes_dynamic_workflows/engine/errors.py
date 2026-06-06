@@ -41,6 +41,10 @@ class WorkflowLaunchDenied(DynamicWorkflowError):
     approval channel is available). The caller should tell the user, not retry."""
 
 
+class WorkflowToolUseError(DynamicWorkflowError):
+    """Raised when the workflow tool should return a tool_use_error result."""
+
+
 class WorkflowTimeout(ChildAgentError):
     """A single child agent exceeded its own timeout.
 

@@ -5,3 +5,4 @@ author: ""
 kind: standalone
 provides_tools:
   - workflow
+  - task_stop

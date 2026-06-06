@@ -7,6 +7,7 @@ import os
 import threading
 import uuid
 import logging
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import replace
 from typing import Any
@@ -15,11 +16,16 @@ from .presets import AgentTypeSpec, resolve_agent_type
 from .worktree import WorkspaceLease, create_workspace_lease
 from ..engine.config import PluginConfig
 from ..engine.errors import ChildAgentError, WorkflowTimeout
-from ..engine.structured_tool import (
+from ..plugin.structured_output import (
+    MAX_STRUCTURED_OUTPUT_RETRIES,
+    STRUCTURED_OUTPUT_CONTINUE_MESSAGE,
+    STRUCTURED_OUTPUT_TOOL_NAME,
     STRUCTURED_OUTPUT_TOOLSET,
     clear_expectation,
-    pop_result,
+    peek_result,
     register_expectation,
+    specialize_structured_output_tool,
+    structured_output_tool_scope,
 )
 from ..engine.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
 
@@ -61,26 +67,36 @@ class HermesChildAgentRunner(ChildAgentRunner):
         if structured_tool and STRUCTURED_OUTPUT_TOOLSET not in toolsets:
             toolsets = toolsets + [STRUCTURED_OUTPUT_TOOLSET]
         _prepare_mcp_tool_registry(self.config)
-        child = self._build_agent(request, runtime, toolsets, lease, agent_type)
-        if request.on_start is not None:
-            try:
-                request.on_start(_child_metadata(child, {}, lease, agent_type, toolsets))
-            except Exception:
-                logger.debug("dynamic workflow child start callback failed", exc_info=True)
-        if structured_tool:
-            register_expectation(lease.task_id, request.schema)
-        try:
-            result = self._run_child_with_timeout(child, request, lease, agent_type, toolsets)
-            if structured_tool and isinstance(result, ChildAgentResult):
-                captured, value, attempts = pop_result(lease.task_id)
-                if captured:
-                    result.metadata["structured_captured"] = True
-                    result.metadata["structured_result"] = value
-                    result.metadata["structured_attempts"] = attempts
-            return result
-        finally:
+        tool_scope = structured_output_tool_scope() if structured_tool else nullcontext()
+        with tool_scope:
+            child = self._build_agent(request, runtime, toolsets, lease, agent_type)
             if structured_tool:
-                clear_expectation(lease.task_id)
+                child.tools = specialize_structured_output_tool(child.tools, request.schema)
+                child.valid_tool_names.add(STRUCTURED_OUTPUT_TOOL_NAME)
+            if request.on_start is not None:
+                try:
+                    request.on_start(_child_metadata(child, {}, lease, agent_type, toolsets))
+                except Exception:
+                    logger.debug("dynamic workflow child start callback failed", exc_info=True)
+            if structured_tool:
+                interrupt = getattr(child, "interrupt", None)
+                register_expectation(
+                    lease.task_id,
+                    request.schema,
+                    interrupt if callable(interrupt) else None,
+                )
+            try:
+                result = self._run_child_with_timeout(child, request, lease, agent_type, toolsets)
+                if structured_tool and isinstance(result, ChildAgentResult):
+                    captured, value, attempts = peek_result(lease.task_id)
+                    if captured:
+                        result.metadata["structured_captured"] = True
+                        result.metadata["structured_result"] = value
+                        result.metadata["structured_attempts"] = attempts
+                return result
+            finally:
+                if structured_tool:
+                    clear_expectation(lease.task_id)
 
     def supports_request_overrides(self) -> bool:
         try:
@@ -91,13 +107,8 @@ class HermesChildAgentRunner(ChildAgentRunner):
 
     def _resolve_runtime(self, request: ChildAgentRequest) -> dict[str, Any]:
         requested_model = (request.model or "").strip() or None
-        requested_provider = (request.provider or "").strip() or None
         if requested_model and not self.config.allow_model_override:
             raise ChildAgentError("model override is disabled for workflow child agents")
-        if requested_provider and not self.config.allow_provider_override:
-            raise ChildAgentError("provider override is disabled for workflow child agents")
-        if requested_provider and not requested_model:
-            raise ChildAgentError("provider override requires an explicit model")
 
         try:
             from hermes_cli.config import load_config
@@ -118,7 +129,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
 
         env_model = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
         effective_model = requested_model or env_model or cfg_model
-        effective_provider = requested_provider
+        effective_provider = None
         explicit_base_url = None
 
         if effective_provider is None and (requested_model or env_model):
@@ -204,7 +215,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
         agent_type: AgentTypeSpec | None,
         toolsets: list[str],
     ) -> ChildAgentResult:
-        timeout = request.timeout_seconds or self.config.child_timeout_seconds
+        timeout = self.config.child_timeout_seconds
         approval_callback = _make_child_approval_callback(
             self.config.child_approval_policy,
             getattr(self.config, "ask_fallback", "smart"),
@@ -235,10 +246,36 @@ class HermesChildAgentRunner(ChildAgentRunner):
 
         def _run() -> dict[str, Any]:
             _register_task_cwd(lease.task_id, lease.cwd)
-            return child.run_conversation(
-                user_message=build_child_task_message(request, workspace=lease.cwd),
-                task_id=lease.task_id,
-            )
+            message = build_child_task_message(request, workspace=lease.cwd)
+            history = None
+            stop_attempts = 0
+            while True:
+                result = child.run_conversation(
+                    user_message=message,
+                    conversation_history=history,
+                    task_id=lease.task_id,
+                )
+                if not request.structured_tool:
+                    return result
+
+                captured, _value, tool_attempts = peek_result(lease.task_id)
+                if captured:
+                    return result
+
+                stop_attempts += 1
+                if (
+                    tool_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
+                    or stop_attempts >= MAX_STRUCTURED_OUTPUT_RETRIES
+                ):
+                    raise ChildAgentError(
+                        "Failed to provide valid structured output after "
+                        f"{MAX_STRUCTURED_OUTPUT_RETRIES} attempts"
+                    )
+
+                previous_messages = result.get("messages") if isinstance(result, dict) else None
+                if isinstance(previous_messages, list):
+                    history = previous_messages
+                message = STRUCTURED_OUTPUT_CONTINUE_MESSAGE
 
         executor = ThreadPoolExecutor(
             max_workers=1,
@@ -346,7 +383,6 @@ def _apply_agent_type_defaults(
     return replace(
         request,
         model=request.model or agent_type.model,
-        provider=request.provider or agent_type.provider,
         isolation=request.isolation or agent_type.isolation,
     )
 

@@ -76,11 +76,9 @@ class DisplayTests(unittest.TestCase):
                         "prompt": "work",
                         "result_preview": "{'ok': True}",
                         "structured": {
-                            "status": "repaired",
-                            "mode": "prompt",
+                            "status": "valid",
+                            "mode": "tool",
                             "attempts": 2,
-                            "raw_preview": "not json",
-                            "repair_runner": "plugin_llm",
                         },
                     }
                 ],
@@ -89,13 +87,13 @@ class DisplayTests(unittest.TestCase):
             },
         }
 
-        row_text = render_workflow_text(run["workflow"], completed=True)
+        render_workflow_text(run["workflow"], completed=True)
         detail = render_agent_detail(run, "json")
 
-        self.assertIn("[repaired]", row_text)
         self.assertIn("Structured output", detail)
-        self.assertIn("Repair runner: plugin_llm", detail)
-        self.assertIn("Raw response", detail)
+        self.assertIn("Status: valid", detail)
+        self.assertIn("Mode: tool", detail)
+        self.assertIn("Attempts: 2", detail)
 
 
 if __name__ == "__main__":

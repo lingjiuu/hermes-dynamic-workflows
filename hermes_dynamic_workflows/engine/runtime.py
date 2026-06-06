@@ -124,11 +124,7 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
             on_update=options.on_update,
             on_journal=options.on_journal,
             plugin_context=options.plugin_context,
-            token_budget_total=(
-                options.token_budget_total
-                if options.token_budget_total is not None
-                else _meta_token_budget(meta)
-            ),
+            token_budget_total=options.token_budget_total,
         )
         frame = root
     else:
@@ -173,24 +169,6 @@ def run_workflow(script: str, options: WorkflowOptions | None = None) -> Workflo
     finally:
         frame.ended_at = monotonic()
         context.notify()
-
-
-def _meta_token_budget(meta: dict[str, Any]) -> int | None:
-    """Read an optional ``token_budget`` baked into the script's meta dict.
-
-    Precedence is tool param > meta > config: this is only consulted when the
-    invocation did not pass an explicit token_budget.
-    """
-    if not isinstance(meta, dict):
-        return None
-    value = meta.get("token_budget")
-    if value in (None, "", False):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
 
 
 def _build_namespace(api: WorkflowAPI) -> dict[str, Any]:

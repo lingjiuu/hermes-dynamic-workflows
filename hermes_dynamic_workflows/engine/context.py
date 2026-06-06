@@ -43,8 +43,6 @@ class WorkflowExecutionContext:
     def __post_init__(self) -> None:
         self.state = WorkflowState(self.root)
         self._agent_slots = threading.BoundedSemaphore(max(1, self.config.concurrency))
-        if self.token_budget_total is None:
-            self.token_budget_total = self.config.token_budget_total
 
     @property
     def spent_tokens(self) -> int:

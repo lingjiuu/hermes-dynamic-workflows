@@ -2,23 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import monotonic
 from typing import Any, Callable
 
 from .cache import agent_fingerprint, is_cache_miss
-from .structured import (
-    build_repair_prompt,
-    build_response_format_overrides,
-    build_schema_instruction,
-    looks_like_response_format_error,
-    parse_structured_output,
-)
-from .structured_tool import build_tool_schema_instruction
+from ..plugin.structured_output import build_tool_schema_instruction
 from ..ui.display import preview
-from .errors import WorkflowHalt, WorkflowRuntimeError, WorkflowTimeout
+from .errors import WorkflowHalt, WorkflowRuntimeError
+from .structured import StructuredOutputError, validate_json_schema
 from .types import AgentRecord, ChildAgentRequest, ChildAgentResult, WorkflowFrame
 
 
@@ -75,10 +68,16 @@ class WorkflowAPI:
             raise WorkflowRuntimeError("agent() expects a non-empty prompt string")
         if not isinstance(opts, dict):
             raise WorkflowRuntimeError("agent() options must be a dict")
+        _validate_agent_opts(opts)
 
         schema = opts.get("schema")
         if schema is not None and not isinstance(schema, dict):
             raise WorkflowRuntimeError("agent() schema option must be a dict")
+        if schema is not None:
+            try:
+                validate_json_schema(schema)
+            except StructuredOutputError as exc:
+                raise WorkflowRuntimeError(str(exc)) from exc
 
         with self._lock:
             agent_id = self.context.reserve_agent()
@@ -98,25 +97,14 @@ class WorkflowAPI:
             self.frame.agents.append(record)
             self._notify()
 
-        structured_mode = self.config.structured_output_mode if schema else ""
-        use_tool_channel = bool(schema) and structured_mode in {"auto", "tool"}
-        if not schema:
-            task_prompt = prompt
-        elif use_tool_channel:
-            task_prompt = prompt + build_tool_schema_instruction(schema)
-        else:
-            task_prompt = prompt + build_schema_instruction(schema)
-        request_overrides = _structured_request_overrides(schema, structured_mode, label, agent_id)
+        task_prompt = prompt + build_tool_schema_instruction() if schema else prompt
         fingerprint = agent_fingerprint(
             prompt,
             {
                 "label": label,
                 "phase": phase_name,
                 "schema": schema,
-                "structured_mode": structured_mode,
-                "toolsets": opts.get("toolsets"),
                 "model": opts.get("model"),
-                "provider": opts.get("provider"),
                 "agentType": agent_type,
                 "isolation": isolation,
             },
@@ -127,7 +115,7 @@ class WorkflowAPI:
             record.status = "done"
             record.result_preview = f"(cached) {preview(cached, 170)}"
             if schema:
-                record.structured = {"status": "cached", "mode": structured_mode, "attempts": 0}
+                record.structured = {"status": "cached", "mode": "tool", "attempts": 0}
             record.started_at = monotonic()
             record.ended_at = record.started_at
             self.resume_cache.put(fingerprint, cached)
@@ -152,34 +140,23 @@ class WorkflowAPI:
             prompt=task_prompt,
             label=label,
             phase=phase_name,
-            toolsets=_normalize_toolsets(opts.get("toolsets")),
+            toolsets=[],
             model=str(opts.get("model")).strip() if opts.get("model") else None,
-            provider=str(opts.get("provider")).strip() if opts.get("provider") else None,
             schema=schema,
-            timeout_seconds=_as_timeout(opts.get("timeout_seconds")),
             agent_type=agent_type,
             isolation=isolation,
             cwd=self.frame.cwd,
-            request_overrides=request_overrides,
-            structured_tool=use_tool_channel,
+            structured_tool=bool(schema),
             on_start=on_child_start,
         )
         if schema:
-            if use_tool_channel:
-                structured_mode_label = "tool"
-            elif request_overrides:
-                structured_mode_label = "response_format"
-            else:
-                structured_mode_label = "prompt"
             record.structured = {
                 "status": "pending",
-                "mode": structured_mode_label,
+                "mode": "tool",
                 "attempts": 0,
-                "repaired": False,
             }
 
-        retries = _as_retries(opts.get("retries"))
-        max_attempts = 1 + retries
+        max_attempts = 1
         record.status = "running"
         record.started_at = monotonic()
         self._journal(
@@ -204,18 +181,19 @@ class WorkflowAPI:
                 self.context.record_tokens(record.tokens)
                 accumulated_tokens += record.tokens
                 if schema:
-                    if isinstance(metadata, dict) and metadata.get("structured_captured"):
-                        result = metadata.get("structured_result")
-                        record.structured.update(
-                            {
-                                "status": "valid",
-                                "mode": "tool",
-                                "attempts": int(metadata.get("structured_attempts") or 1),
-                                "error": "",
-                            }
+                    if not isinstance(metadata, dict) or not metadata.get("structured_captured"):
+                        raise WorkflowRuntimeError(
+                            "child agent did not submit valid structured output"
                         )
-                    else:
-                        result = self._parse_or_repair_structured(result, schema, record, request)
+                    result = metadata.get("structured_result")
+                    record.structured.update(
+                        {
+                            "status": "valid",
+                            "mode": "tool",
+                            "attempts": int(metadata.get("structured_attempts") or 1),
+                            "error": "",
+                        }
+                    )
                 record.status = "done"
                 record.attempts = attempt + 1
                 record.tokens = accumulated_tokens
@@ -236,22 +214,9 @@ class WorkflowAPI:
                 raise
             except Exception as exc:
                 record.attempts = attempt + 1
-                # Don't retry timeouts (would multiply long waits); retry other
-                # failures while attempts remain.
-                retryable = not isinstance(exc, WorkflowTimeout)
-                if retryable and attempt + 1 < max_attempts:
-                    record.status = "retrying"
-                    with self._lock:
-                        self.frame.logs.append(
-                            f"{label}: attempt {attempt + 1} failed "
-                            f"({type(exc).__name__}: {exc}); retrying"
-                        )
-                    self._notify()
-                    continue
                 record.status = "error"
                 record.tokens = accumulated_tokens
-                suffix = f" (after {attempt + 1} attempts)" if max_attempts > 1 else ""
-                record.error = f"{type(exc).__name__}: {exc}{suffix}"
+                record.error = f"{type(exc).__name__}: {exc}"
                 with self._lock:
                     self.frame.errors.append(f"{label}: {record.error}")
                 self._journal(
@@ -269,162 +234,7 @@ class WorkflowAPI:
         return None
 
     def _run_child(self, request: ChildAgentRequest, record: AgentRecord) -> Any:
-        try:
-            return self.runner.run(request)
-        except Exception as exc:
-            if (
-                request.request_overrides
-                and self.config.structured_output_mode == "response_format"
-                and looks_like_response_format_error(exc)
-            ):
-                record.structured.update(
-                    {
-                        "status": "response_format_fallback",
-                        "mode": "prompt",
-                        "response_format_error": preview(f"{type(exc).__name__}: {exc}", 240),
-                    }
-                )
-                self._notify()
-                return self.runner.run(replace(request, request_overrides=None))
-            raise
-
-    def _parse_or_repair_structured(
-        self,
-        raw: Any,
-        schema: dict[str, Any],
-        record: AgentRecord,
-        request: ChildAgentRequest,
-    ) -> Any:
-        raw_preview = preview(raw, self.config.structured_raw_preview_chars)
-        record.structured.update(
-            {
-                "status": "validating",
-                "attempts": 1,
-                "raw_preview": raw_preview,
-            }
-        )
-        self._notify()
-        try:
-            parsed = parse_structured_output(raw, schema)
-            record.structured.update({"status": "valid", "error": ""})
-            return parsed
-        except Exception as first_error:
-            record.structured.update(
-                {
-                    "status": "repairing" if self.config.structured_retries > 0 else "failed",
-                    "error": f"{type(first_error).__name__}: {first_error}",
-                }
-            )
-            self._notify()
-            if self.config.structured_retries <= 0:
-                raise
-
-            repaired = self._repair_structured_output(raw, schema, first_error, record, request)
-            record.structured["attempts"] = 2
-            try:
-                parsed = parse_structured_output(repaired, schema)
-            except Exception as second_error:
-                record.structured.update(
-                    {
-                        "status": "failed",
-                        "error": f"{type(second_error).__name__}: {second_error}",
-                    }
-                )
-                raise
-            record.structured.update(
-                {
-                    "status": "repaired",
-                    "error": "",
-                    "repaired": True,
-                    "repair_preview": preview(repaired, self.config.structured_raw_preview_chars),
-                }
-            )
-            return parsed
-
-    def _repair_structured_output(
-        self,
-        raw: Any,
-        schema: dict[str, Any],
-        error: Exception,
-        record: AgentRecord,
-        request: ChildAgentRequest,
-    ) -> Any:
-        prompt = build_repair_prompt(raw, f"{type(error).__name__}: {error}", schema)
-        if self.config.structured_repair_with_llm:
-            repaired = self._repair_with_plugin_llm(prompt, schema, record, request)
-            if repaired is not None:
-                return repaired
-        return self._repair_with_child_runner(prompt, schema, record, request)
-
-    def _repair_with_plugin_llm(
-        self,
-        prompt: str,
-        schema: dict[str, Any],
-        record: AgentRecord,
-        request: ChildAgentRequest,
-    ) -> Any | None:
-        plugin_context = getattr(self.context, "plugin_context", None)
-        llm = getattr(plugin_context, "llm", None)
-        complete = getattr(llm, "complete_structured", None)
-        if not callable(complete):
-            return None
-        try:
-            result = complete(
-                instructions="Repair invalid workflow child-agent output into schema-valid JSON.",
-                input=[{"type": "text", "text": prompt}],
-                json_schema=schema,
-                schema_name=f"workflow_agent_{request.id}_structured_repair",
-                timeout=min(float(request.timeout_seconds or self.config.child_timeout_seconds), 60.0),
-                purpose="dynamic_workflow_structured_repair",
-            )
-        except Exception as exc:
-            record.structured["repair_error"] = preview(f"{type(exc).__name__}: {exc}", 240)
-            self._notify()
-            return None
-
-        usage = getattr(result, "usage", None)
-        total_tokens = _usage_total_tokens(usage)
-        if total_tokens:
-            record.tokens += total_tokens
-            self.context.record_tokens(total_tokens)
-            record.structured["repair_tokens"] = total_tokens
-
-        parsed = getattr(result, "parsed", None)
-        if parsed is not None:
-            record.structured["repair_runner"] = "plugin_llm"
-            return parsed
-        text = getattr(result, "text", None)
-        if text:
-            record.structured["repair_runner"] = "plugin_llm"
-            return text
-        return None
-
-    def _repair_with_child_runner(
-        self,
-        prompt: str,
-        schema: dict[str, Any],
-        record: AgentRecord,
-        request: ChildAgentRequest,
-    ) -> Any:
-        repair_request = replace(
-            request,
-            prompt=prompt,
-            label=f"{request.label}:structured-repair",
-            toolsets=[],
-            schema=schema,
-            request_overrides=None,
-            on_start=None,
-        )
-        with self.context.agent_slot():
-            raw_result = self.runner.run(repair_request)
-        metadata = raw_result.metadata if isinstance(raw_result, ChildAgentResult) else {}
-        repair_tokens = _as_int_metadata(metadata.get("tokens")) if isinstance(metadata, dict) else 0
-        if repair_tokens:
-            record.tokens += repair_tokens
-            self.context.record_tokens(repair_tokens)
-            record.structured["repair_tokens"] = repair_tokens
-        record.structured["repair_runner"] = "child_agent"
-        return raw_result.content if isinstance(raw_result, ChildAgentResult) else raw_result
+        return self.runner.run(request)
 
     def parallel(self, thunks: list[Callable[[], Any]]) -> list[Any]:
         self._check_deadline()
@@ -524,52 +334,33 @@ class WorkflowAPI:
         self.context.journal(event)
 
 
-def _normalize_toolsets(value: Any) -> list[str]:
-    if not value:
-        return []
-    if isinstance(value, str):
-        raw = value.split(",")
-    elif isinstance(value, (list, tuple)):
-        raw = value
-    else:
-        raise WorkflowRuntimeError("toolsets must be a string or list of strings")
-    return [str(item).strip() for item in raw if str(item).strip()]
+_PUBLIC_AGENT_OPT_KEYS = frozenset(
+    {
+        "label",
+        "phase",
+        "schema",
+        "model",
+        "isolation",
+        "agentType",
+        # Compatibility with Python-style scripts. The model-facing API should
+        # still prefer Claude-style ``agentType``.
+        "agent_type",
+    }
+)
 
 
-def _as_timeout(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        return max(1.0, float(value))
-    except (TypeError, ValueError):
-        raise WorkflowRuntimeError("timeout_seconds must be a number") from None
-
-
-def _as_retries(value: Any) -> int:
-    """Number of extra attempts after the first failure (0 = no retry).
-
-    Capped at 5 to bound cost. This is leaf-level retry on top of Hermes'
-    native per-API-call retry, for when a whole child gives up. Not part of the
-    cache fingerprint — it is an execution policy, not task identity.
-    """
-    if value in (None, "", False):
-        return 0
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        raise WorkflowRuntimeError("retries must be a non-negative integer") from None
-    return max(0, min(parsed, 5))
-
-
-def _structured_request_overrides(
-    schema: dict[str, Any] | None,
-    mode: str,
-    label: str,
-    agent_id: int,
-) -> dict[str, Any] | None:
-    if not schema or mode != "response_format":
-        return None
-    return build_response_format_overrides(schema, name=f"workflow_agent_{agent_id}_{label}")
+def _validate_agent_opts(opts: dict[str, Any]) -> None:
+    unknown = sorted(str(key) for key in opts if str(key) not in _PUBLIC_AGENT_OPT_KEYS)
+    if not unknown:
+        return
+    raise WorkflowRuntimeError(
+        "unsupported agent() option(s): "
+        + ", ".join(unknown)
+        + ". Public workflow agent options are label, phase, schema, model, "
+        "isolation, and agentType. Put tool access in agentType presets or "
+        "plugin config; provider/runtime, timeout, and retry policy belong in "
+        "Hermes/plugin configuration, not workflow scripts."
+    )
 
 
 def _normalize_agent_type(value: Any) -> str | None:
@@ -619,28 +410,5 @@ def _optional_str(value: Any) -> str | None:
 def _as_int_metadata(value: Any) -> int:
     try:
         return max(0, int(value))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _usage_total_tokens(usage: Any) -> int:
-    if usage is None:
-        return 0
-    for name in ("total_tokens", "tokens"):
-        value = getattr(usage, name, None)
-        if isinstance(value, (int, float)):
-            return max(0, int(value))
-    if isinstance(usage, dict):
-        for name in ("total_tokens", "tokens"):
-            value = usage.get(name)
-            if isinstance(value, (int, float)):
-                return max(0, int(value))
-    input_tokens = getattr(usage, "input_tokens", 0) or 0
-    output_tokens = getattr(usage, "output_tokens", 0) or 0
-    if isinstance(usage, dict):
-        input_tokens = usage.get("input_tokens", input_tokens) or 0
-        output_tokens = usage.get("output_tokens", output_tokens) or 0
-    try:
-        return max(0, int(input_tokens) + int(output_tokens))
     except (TypeError, ValueError):
         return 0

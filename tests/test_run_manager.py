@@ -373,7 +373,7 @@ def workflow():
         # No new child runs on resume — all three came from the cache.
         self.assertEqual(len(runner.labels), 3)
 
-    def test_token_budget_param_gates_run(self):
+    def test_internal_token_budget_gates_run(self):
         script = """
 meta = {"name": "budget-param"}
 
@@ -385,15 +385,17 @@ def workflow():
             manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
             with patch(
                 "hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner",
-                return_value=BudgetRunner(tokens=20),
+                return_value=BudgetRunner(tokens=20_000),
             ):
                 record = manager.start_from_params(
-                    {"script": script, "token_budget": 10}, cwd=tmp
+                    {"script": script, "token_budget": 1},
+                    cwd=tmp,
+                    user_task="+10k run a workflow",
                 )
                 final = manager.wait(record["runId"], timeout=2)
 
-        self.assertEqual(record["tokenBudget"], 10)
-        # First agent spends 20 > 10, so the second agent's reservation trips the
+        self.assertEqual(record["tokenBudget"], 10_000)
+        # First agent spends 20k > 10k, so the second agent's reservation trips the
         # hard ceiling and the run errors.
         self.assertEqual(final["status"], "error")
         self.assertIn("budget", (final["error"] or "").lower())

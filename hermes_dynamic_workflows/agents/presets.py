@@ -17,7 +17,6 @@ class AgentTypeSpec:
     source: str
     toolsets: tuple[str, ...] = ()
     model: str | None = None
-    provider: str | None = None
     isolation: str | None = None
 
 
@@ -107,7 +106,6 @@ def _load_markdown_agent_type(name: str, path: Path) -> AgentTypeSpec:
         source=str(path),
         toolsets=_as_tuple(frontmatter.get("toolsets") or frontmatter.get("tools")),
         model=_as_optional_str(frontmatter.get("model")),
-        provider=_as_optional_str(frontmatter.get("provider")),
         isolation=_as_optional_str(frontmatter.get("isolation")),
     )
 
@@ -131,7 +129,6 @@ def _load_structured_agent_type(name: str, path: Path, data: Any) -> AgentTypeSp
         source=str(path),
         toolsets=_as_tuple(data.get("toolsets") or data.get("tools")),
         model=_as_optional_str(data.get("model")),
-        provider=_as_optional_str(data.get("provider")),
         isolation=_as_optional_str(data.get("isolation")),
     )
 

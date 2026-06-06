@@ -11,8 +11,9 @@ from typing import Any
 
 from .cache import ResumeCache
 from .config import PluginConfig, load_config
-from .errors import WorkflowLaunchDenied, WorkflowRuntimeError
+from .errors import WorkflowLaunchDenied, WorkflowRuntimeError, WorkflowToolUseError
 from .sandbox import extract_meta, parse_script
+from .token_budget import parse_token_budget
 from ..storage.store import (
     WorkflowStore,
     new_run_id,
@@ -121,11 +122,21 @@ class WorkflowRunManager:
         plugin_context: Any = None,
         tool_use_id: str | None = None,
         host_session_id: str | None = None,
+        user_task: str | None = None,
     ) -> dict[str, Any]:
         config = self.config
         cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         source = resolve_workflow_source(params, store=self.store, cwd=cwd)
         meta = extract_meta(parse_script(source.script, config))
+        resume_from = str(params.get("resumeFromRunId") or "").strip() or None
+        active_resume = self._active_resume_run(resume_from) if resume_from else None
+        if active_resume:
+            active_task_id = str(active_resume.get("taskId") or "")
+            raise WorkflowToolUseError(
+                f"Workflow {resume_from} is still running (task {active_task_id}). "
+                f'Stop it first with task_stop({{"task_id":"{active_task_id}"}}) '
+                "before resuming."
+            )
         approved, reason = _approve_launch(meta, config, plugin_context)
         if not approved:
             raise WorkflowLaunchDenied(
@@ -149,11 +160,10 @@ class WorkflowRunManager:
         journal_path = transcript_dir / "journal.jsonl"
         transcript_dir.mkdir(parents=True, exist_ok=True)
         journal_path.touch(exist_ok=True)
-        resume_from = str(params.get("resumeFromRunId") or "").strip() or None
         previous = self.store.load_run(resume_from) if resume_from else None
         resume_cache = ResumeCache.from_run(previous)
         args = params["args"] if "args" in params else None
-        token_budget = _as_positive_int(params.get("token_budget"))
+        token_budget = parse_token_budget(user_task)
         # Captured in the launching (parent) context, which carries the gateway
         # session vars when the run is started from a gateway session.
         session_context = _capture_gateway_session_context()
@@ -223,6 +233,54 @@ class WorkflowRunManager:
                     return self._public_record(dict(managed.record))
         record = self.store.find_run_by_task_id(str(task_id))
         return self._public_record(record) if record else None
+
+    def _active_resume_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            managed = self._runs.get(run_id)
+        if not managed:
+            return None
+        with managed.lock:
+            if managed.record.get("status") in {"queued", "running", "stopping"}:
+                return self._public_record(dict(managed.record))
+        return None
+
+    def stop_task(self, task_id: str) -> dict[str, Any] | None:
+        """Stop an active background workflow by Claude-style task id.
+
+        This intentionally only checks live managed runs. Historical runs in
+        state are not stoppable tasks, so stopping a completed or already
+        stopped task should look like Claude Code's "No task found" result.
+        """
+        wanted = str(task_id or "")
+        if not wanted:
+            return None
+        with self._lock:
+            managed_runs = list(self._runs.values())
+        for managed in managed_runs:
+            child_runner = None
+            with managed.lock:
+                record = managed.record
+                if str(record.get("taskId") or "") != wanted:
+                    continue
+                if record.get("status") not in {"queued", "running"}:
+                    return None
+                managed.stop_event.set()
+                child_runner = managed.child_runner
+                record["status"] = "stopping"
+                self.store.save_run(record)
+                summary = str(record.get("summary") or record.get("runId") or wanted)
+                result = {
+                    "message": f"Successfully stopped task: {wanted} ({summary})",
+                    "task_id": wanted,
+                    "task_type": "local_workflow",
+                }
+            if child_runner is not None and hasattr(child_runner, "interrupt_all"):
+                try:
+                    child_runner.interrupt_all()
+                except Exception:
+                    pass
+            return result
+        return None
 
     def list(self, limit: int = 20) -> list[dict[str, Any]]:
         return [self._public_record(run) for run in self.store.list_runs(limit=limit)]
@@ -941,17 +999,6 @@ def _derive_run_status(snapshot: dict[str, Any]) -> str:
     if agents > 0 and done == 0:
         return "failed"
     return "completed"
-
-
-def _as_positive_int(value: Any) -> int | None:
-    """Coerce a per-invocation token_budget to a positive int, or None."""
-    if value in (None, "", False):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
 
 
 _MANAGER: WorkflowRunManager | None = None

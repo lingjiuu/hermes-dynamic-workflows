@@ -40,29 +40,6 @@ class TokenRunner(ChildAgentRunner):
         return ChildAgentResult(content=request.label, metadata={"tokens": self.tokens})
 
 
-class ResponseFormatFallbackRunner(ChildAgentRunner):
-    def __init__(self):
-        self.requests: list[ChildAgentRequest] = []
-
-    def run(self, request: ChildAgentRequest):
-        self.requests.append(request)
-        if request.request_overrides:
-            raise RuntimeError("response_format is not supported by this provider")
-        return '{"ok": true}'
-
-
-class FlakyRunner(ChildAgentRunner):
-    def __init__(self, fail_times: int):
-        self.calls = 0
-        self.fail_times = fail_times
-
-    def run(self, request: ChildAgentRequest):
-        self.calls += 1
-        if self.calls <= self.fail_times:
-            raise RuntimeError("transient boom")
-        return f"ok:{request.label}"
-
-
 class RuntimeTests(unittest.TestCase):
     def test_runs_workflow_function(self):
         script = """
@@ -70,7 +47,7 @@ meta = {"name": "simple", "phases": ["scan"]}
 
 def workflow():
     phase("scan")
-    return agent("inspect repo", {"label": "scan-agent", "toolsets": ["web"]})
+    return agent("inspect repo", {"label": "scan-agent"})
 """
         runner = FakeRunner()
         result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
@@ -78,7 +55,7 @@ def workflow():
         self.assertEqual(result.value, "scan-agent:inspect repo")
         self.assertEqual(result.agent_count, 1)
         self.assertEqual(runner.requests[0].label, "scan-agent")
-        self.assertEqual(runner.requests[0].toolsets, ["web"])
+        self.assertEqual(runner.requests[0].toolsets, [])
         self.assertEqual(result.state.current_phase, "scan")
 
     def test_parallel_preserves_order(self):
@@ -111,96 +88,70 @@ def workflow():
         {"label": "json", "schema": {"type": "object", "required": ["ok"]}},
     )
 """
+        runner = FakeRunner(
+            responses=[
+                ChildAgentResult(
+                    content="done",
+                    metadata={
+                        "structured_captured": True,
+                        "structured_result": {"ok": True},
+                        "structured_attempts": 1,
+                    },
+                )
+            ]
+        )
+        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertEqual(result.value, {"ok": True})
+
+    def test_structured_output_does_not_parse_final_message(self):
+        script = """
+meta = {"name": "structured-no-parse"}
+
+def workflow():
+    return agent(
+        "return status",
+        {"label": "json", "schema": {"type": "object", "required": ["ok"]}},
+    )
+"""
         runner = FakeRunner(responses=['{"ok": true}'])
         result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
 
-        self.assertEqual(result.value, {"ok": True})
-
-    def test_structured_output_repairs_invalid_json(self):
-        script = """
-meta = {"name": "structured-repair"}
-
-def workflow():
-    return agent(
-        "return status",
-        {"label": "json", "schema": {"type": "object", "required": ["ok"]}},
-    )
-"""
-        runner = FakeRunner(responses=["not json", '{"ok": true}'])
-        result = run_workflow(
-            script,
-            WorkflowOptions(
-                config=PluginConfig(structured_repair_with_llm=False),
-                child_runner=runner,
-            ),
-        )
-
-        self.assertEqual(result.value, {"ok": True})
-        self.assertEqual(len(runner.requests), 2)
-        self.assertIn("structured-repair", runner.requests[1].label)
-        agent = result.state.snapshot()["agents"][0]
-        self.assertEqual(agent["structured"]["status"], "repaired")
-
-    def test_structured_output_falls_back_when_response_format_is_unsupported(self):
-        script = """
-meta = {"name": "structured-fallback"}
-
-def workflow():
-    return agent(
-        "return status",
-        {"label": "json", "schema": {"type": "object", "required": ["ok"]}},
-    )
-"""
-        runner = ResponseFormatFallbackRunner()
-        result = run_workflow(
-            script,
-            WorkflowOptions(
-                config=PluginConfig(structured_output_mode="response_format"),
-                child_runner=runner,
-            ),
-        )
-
-        self.assertEqual(result.value, {"ok": True})
-        self.assertEqual(len(runner.requests), 2)
-        self.assertIsNotNone(runner.requests[0].request_overrides)
-        self.assertIsNone(runner.requests[1].request_overrides)
-        agent = result.state.snapshot()["agents"][0]
-        self.assertEqual(agent["structured"]["status"], "valid")
-        self.assertEqual(agent["structured"]["mode"], "prompt")
-        self.assertIn("response_format_error", agent["structured"])
-
-    def test_agent_retries_until_success(self):
-        script = """
-meta = {"name": "retry-ok"}
-
-def workflow():
-    return agent("go", {"label": "r", "retries": 2})
-"""
-        runner = FlakyRunner(fail_times=2)
-        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
-
-        self.assertEqual(result.value, "ok:r")
-        self.assertEqual(runner.calls, 3)  # 1 + 2 retries
-        agent = result.state.snapshot()["agents"][0]
-        self.assertEqual(agent["status"], "done")
-        self.assertEqual(agent["attempts"], 3)
-
-    def test_agent_retries_exhausted_returns_none(self):
-        script = """
-meta = {"name": "retry-fail"}
-
-def workflow():
-    return agent("go", {"label": "r", "retries": 1})
-"""
-        runner = FlakyRunner(fail_times=5)
-        result = run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
-
         self.assertIsNone(result.value)
-        self.assertEqual(runner.calls, 2)  # 1 + 1 retry, then give up
+        self.assertEqual(len(runner.requests), 1)
         agent = result.state.snapshot()["agents"][0]
         self.assertEqual(agent["status"], "error")
-        self.assertEqual(agent["attempts"], 2)
-        self.assertIn("after 2 attempts", agent["error"])
+        self.assertIn("did not submit valid structured output", agent["error"])
+
+    def test_invalid_structured_schema_fails_before_child_launch(self):
+        script = """
+meta = {"name": "invalid-schema"}
+
+def workflow():
+    return agent(
+        "return status",
+        {"label": "json", "schema": {"type": 123}},
+    )
+"""
+        runner = FakeRunner()
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=runner))
+
+        self.assertEqual(runner.requests, [])
+        self.assertIn("invalid JSON Schema", str(ctx.exception))
+
+    def test_agent_rejects_runtime_policy_options(self):
+        script = """
+meta = {"name": "unsupported-options"}
+
+def workflow():
+    return agent("go", {"label": "r", "toolsets": ["web"], "retries": 2})
+"""
+        with self.assertRaises(Exception) as ctx:
+            run_workflow(script, WorkflowOptions(config=PluginConfig(), child_runner=FakeRunner()))
+        self.assertIn("unsupported agent() option", str(ctx.exception))
+        self.assertIn("toolsets", str(ctx.exception))
+        self.assertIn("retries", str(ctx.exception))
 
     def test_requires_agent_call(self):
         script = """
@@ -262,8 +213,9 @@ def workflow():
         result = run_workflow(
             script,
             WorkflowOptions(
-                config=PluginConfig(token_budget_total=100),
+                config=PluginConfig(),
                 child_runner=TokenRunner(tokens=40),
+                token_budget_total=100,
             ),
         )
 
@@ -284,11 +236,28 @@ def workflow():
             run_workflow(
                 script,
                 WorkflowOptions(
-                    config=PluginConfig(token_budget_total=10),
+                    config=PluginConfig(),
                     child_runner=TokenRunner(tokens=20),
+                    token_budget_total=10,
                 ),
             )
         self.assertFalse(issubclass(WorkflowLimitExceeded, Exception))
+
+    def test_meta_token_budget_is_ignored(self):
+        script = """
+meta = {"name": "budget-meta", "token_budget": 100}
+
+def workflow():
+    agent("a", {"label": "a"})
+    return {"total": budget.total, "remaining": budget.remaining()}
+"""
+        result = run_workflow(
+            script,
+            WorkflowOptions(config=PluginConfig(), child_runner=TokenRunner(tokens=40)),
+        )
+
+        self.assertIsNone(result.value["total"])
+        self.assertEqual(result.value["remaining"], float("inf"))
 
     def test_subworkflow_nesting_is_one_level(self):
         parent = """
@@ -398,8 +367,9 @@ def workflow():
             run_workflow(
                 script,
                 WorkflowOptions(
-                    config=PluginConfig(token_budget_total=10),
+                    config=PluginConfig(),
                     child_runner=TokenRunner(tokens=20),
+                    token_budget_total=10,
                 ),
             )
 

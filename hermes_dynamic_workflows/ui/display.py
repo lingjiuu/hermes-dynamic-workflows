@@ -153,20 +153,8 @@ def render_agent_detail(run: dict[str, Any], selector: str) -> str:
             lines.append(f"Mode: {structured.get('mode')}")
         if structured.get("attempts") is not None:
             lines.append(f"Attempts: {structured.get('attempts')}")
-        if structured.get("repair_runner"):
-            lines.append(f"Repair runner: {structured.get('repair_runner')}")
-        if structured.get("repair_tokens"):
-            lines.append(f"Repair tokens: {_format_tokens(structured.get('repair_tokens'))}")
-        if structured.get("response_format_error"):
-            lines.append(f"Response format fallback: {structured.get('response_format_error')}")
-        if structured.get("repair_error"):
-            lines.append(f"Repair fallback: {structured.get('repair_error')}")
         if structured.get("error"):
             lines.append(f"Error: {structured.get('error')}")
-        if structured.get("raw_preview"):
-            lines.extend(["", "Raw response", preview(structured.get("raw_preview"), 2000)])
-        if structured.get("repair_preview"):
-            lines.extend(["", "Repair response", preview(structured.get("repair_preview"), 2000)])
     lines.extend(["", "Prompt", preview(agent.get("prompt") or agent.get("prompt_preview") or "", 2000)])
     lines.extend(["", "Outcome", agent.get("result_preview") or agent.get("error") or "Still running..."])
     return "\n".join(lines)
@@ -195,10 +183,6 @@ def render_agent_row(agent: dict[str, Any]) -> str:
         structured_status = structured.get("status")
         if structured_status == "failed":
             parts.append("schema failed")
-        elif structured_status == "repaired":
-            parts.append("schema repaired")
-        elif structured_status == "response_format_fallback":
-            parts.append("schema fallback")
     if agent.get("error"):
         parts.append(preview(agent.get("error"), 120))
     return " . ".join(parts)
@@ -291,7 +275,7 @@ def _render_agent(agent: dict[str, Any], indent: str) -> str:
     label = agent.get("label") or f"agent-{agent.get('id', '?')}"
     line = f"{indent}#{agent.get('id')} {marker} {label}"
     structured = agent.get("structured")
-    if isinstance(structured, dict) and structured.get("status") in {"failed", "repaired"}:
+    if isinstance(structured, dict) and structured.get("status") == "failed":
         line += f" [{structured.get('status')}]"
     if agent.get("error"):
         line += f" - {preview(agent['error'], 100)}"

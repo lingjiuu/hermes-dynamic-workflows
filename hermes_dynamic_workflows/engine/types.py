@@ -199,9 +199,7 @@ class ChildAgentRequest:
     phase: str | None
     toolsets: list[str]
     model: str | None = None
-    provider: str | None = None
     schema: dict[str, Any] | None = None
-    timeout_seconds: float | None = None
     agent_type: str | None = None
     isolation: str | None = None
     cwd: str | None = None

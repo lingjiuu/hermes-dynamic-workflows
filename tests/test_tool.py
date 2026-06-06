@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import threading
@@ -10,8 +11,8 @@ from unittest.mock import patch
 from hermes_dynamic_workflows.engine.config import PluginConfig
 from hermes_dynamic_workflows.engine.manager import WorkflowRunManager
 from hermes_dynamic_workflows.engine.types import ChildAgentRequest, ChildAgentRunner
-from hermes_dynamic_workflows.plugin.task_output import task_output
-from hermes_dynamic_workflows.plugin.workflow import workflow
+from hermes_dynamic_workflows.plugin.task_stop import task_stop
+from hermes_dynamic_workflows.plugin.workflow import DYNAMIC_WORKFLOW_SCHEMA, workflow
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 
 
@@ -24,6 +25,7 @@ class BlockingRunner(ChildAgentRunner):
     def __init__(self):
         self.started = threading.Event()
         self.release = threading.Event()
+        self.interrupted = False
 
     def run(self, request: ChildAgentRequest):
         self.started.set()
@@ -31,8 +33,59 @@ class BlockingRunner(ChildAgentRunner):
             raise TimeoutError("test runner was not released")
         return f"done:{request.label}"
 
+    def interrupt_all(self):
+        self.interrupted = True
+        self.release.set()
+
 
 class ToolTests(unittest.TestCase):
+    def test_tool_parses_budget_only_from_user_task(self):
+        script = """
+meta = {"name": "budget-source"}
+
+def workflow():
+    agent("do it", {"label": "worker"})
+    return budget.total
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with (
+                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=FakeRunner()),
+            ):
+                with_budget = workflow(
+                    {"script": script, "token_budget": 1},
+                    task_id="tool-session",
+                    user_task="+500k run a workflow",
+                )
+                with_budget_id = re.search(
+                    r"^Run ID: (wf_[a-z0-9]{8}-[a-z0-9]{3})$",
+                    with_budget,
+                    re.MULTILINE,
+                ).group(1)
+                with_budget_final = manager.wait(with_budget_id, timeout=2)
+
+                without_budget = workflow(
+                    {"script": script, "token_budget": 1},
+                    task_id="tool-session",
+                    user_task="run a workflow",
+                )
+                without_budget_id = re.search(
+                    r"^Run ID: (wf_[a-z0-9]{8}-[a-z0-9]{3})$",
+                    without_budget,
+                    re.MULTILINE,
+                ).group(1)
+                without_budget_final = manager.wait(without_budget_id, timeout=2)
+
+        self.assertNotIn("token_budget", DYNAMIC_WORKFLOW_SCHEMA["parameters"]["properties"])
+        self.assertEqual(with_budget_final["tokenBudget"], 500_000)
+        self.assertEqual(with_budget_final["result"], 500_000)
+        self.assertIsNone(without_budget_final["tokenBudget"])
+        self.assertIsNone(without_budget_final["result"])
+
     def test_tool_returns_claude_style_launch_text(self):
         script = """
 meta = {"name": "tool-test"}
@@ -68,45 +121,117 @@ def workflow():
         self.assertEqual(final["result"], "done:worker")
         self.assertEqual(final["workflow"]["meta"]["name"], "tool-test")
 
-    def test_task_output_reports_running_and_completed_workflow(self):
+    def test_task_stop_stops_active_workflow_by_task_id(self):
         script = """
-meta = {"name": "task-output-test"}
+meta = {"name": "stop-test", "description": "Stop me"}
 
 def workflow():
-    return agent("do it", {"label": "worker"})
+    return agent("wait", {"label": "worker"})
 """
-        runner = BlockingRunner()
         with tempfile.TemporaryDirectory() as tmp:
+            runner = BlockingRunner()
             manager = WorkflowRunManager(
                 store=WorkflowStore(Path(tmp)),
                 config=PluginConfig(require_launch_approval=False),
             )
             with (
-                patch("hermes_dynamic_workflows.plugin.task_output.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.plugin.task_stop.get_run_manager", return_value=manager),
                 patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=runner),
             ):
-                rec = manager.start_from_params({"script": script}, cwd=tmp, host_session_id="tool-session")
+                launch = workflow({"script": script}, task_id="tool-session")
+                run_id = re.search(
+                    r"^Run ID: (wf_[a-z0-9]{8}-[a-z0-9]{3})$",
+                    launch,
+                    re.MULTILINE,
+                ).group(1)
+                task_id = re.search(r"Task ID: (wg[a-z0-9]{7})", launch).group(1)
                 self.assertTrue(runner.started.wait(timeout=2))
 
-                running = task_output({"task_id": rec["taskId"], "block": False})
-                self.assertIn("<retrieval_status>not_ready</retrieval_status>", running)
-                self.assertIn(f"<task_id>{rec['taskId']}</task_id>", running)
-                self.assertIn("<task_type>local_workflow</task_type>", running)
-                self.assertIn("<status>running</status>", running)
+                out = json.loads(task_stop({"task_id": task_id}))
+                second = json.loads(task_stop({"task_id": task_id}))
+                final = manager.wait(run_id, timeout=2)
 
-                timeout = task_output({"task_id": rec["taskId"], "block": True, "timeout": 0})
-                self.assertIn("<retrieval_status>timeout</retrieval_status>", timeout)
-                self.assertIn("<status>running</status>", timeout)
+        self.assertEqual(
+            out,
+            {
+                "message": f"Successfully stopped task: {task_id} (Stop me)",
+                "task_id": task_id,
+                "task_type": "local_workflow",
+            },
+        )
+        self.assertTrue(runner.interrupted)
+        self.assertEqual(
+            second,
+            {"error": f"No task found with ID: {task_id}"},
+        )
+        self.assertEqual(final["status"], "stopped")
 
-                runner.release.set()
-                final = manager.wait(rec["runId"], timeout=2)
-                self.assertEqual(final["status"], "completed")
+    def test_task_stop_errors_for_missing_or_unknown_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with patch("hermes_dynamic_workflows.plugin.task_stop.get_run_manager", return_value=manager):
+                missing = task_stop({})
+                unknown = task_stop({"task_id": "wgunknown"})
 
-                completed = task_output({"task_id": rec["taskId"], "block": False})
-                self.assertIn("<retrieval_status>success</retrieval_status>", completed)
-                self.assertIn("<status>completed</status>", completed)
-                self.assertIn("<output>\ndone:worker\n</output>", completed)
+        self.assertEqual(
+            json.loads(missing),
+            {"error": "Missing required parameter: task_id"},
+        )
+        self.assertEqual(
+            json.loads(unknown),
+            {"error": "No task found with ID: wgunknown"},
+        )
 
+    def test_resume_active_workflow_returns_tool_use_error(self):
+        script = """
+meta = {"name": "resume-active", "description": "Still running"}
+
+def workflow():
+    return agent("wait", {"label": "worker"})
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = BlockingRunner()
+            manager = WorkflowRunManager(
+                store=WorkflowStore(Path(tmp)),
+                config=PluginConfig(require_launch_approval=False),
+            )
+            with (
+                patch("hermes_dynamic_workflows.plugin.workflow.get_run_manager", return_value=manager),
+                patch("hermes_dynamic_workflows.agents.runner.HermesChildAgentRunner", return_value=runner),
+            ):
+                launch = workflow({"script": script}, task_id="tool-session")
+                run_id = re.search(
+                    r"^Run ID: (wf_[a-z0-9]{8}-[a-z0-9]{3})$",
+                    launch,
+                    re.MULTILINE,
+                ).group(1)
+                task_id = re.search(r"Task ID: (wg[a-z0-9]{7})", launch).group(1)
+                self.assertTrue(runner.started.wait(timeout=2))
+
+                blocked = workflow(
+                    {"script": script, "resumeFromRunId": run_id},
+                    task_id="tool-session",
+                )
+                manager.stop_task(task_id)
+                final = manager.wait(run_id, timeout=2)
+                run_count = len(manager.list(limit=10))
+
+        self.assertEqual(
+            json.loads(blocked),
+            {
+                "error": (
+                    f"Workflow {run_id} is still running (task {task_id}). "
+                    f'Stop it first with task_stop({{"task_id":"{task_id}"}}) '
+                    "before resuming."
+                )
+            },
+        )
+        self.assertEqual(final["status"], "stopped")
+        self.assertEqual(run_count, 1)
 
 if __name__ == "__main__":
     unittest.main()

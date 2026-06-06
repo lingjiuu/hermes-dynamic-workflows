@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import re
-from dataclasses import dataclass
 from typing import Any
 
 from .errors import ChildAgentError
@@ -14,87 +12,26 @@ class StructuredOutputError(ChildAgentError):
     """Raised when child-agent output cannot satisfy a requested JSON schema."""
 
 
-@dataclass(frozen=True)
-class StructuredAttempt:
-    status: str
-    mode: str
-    attempts: int
-    raw_preview: str = ""
-    error: str = ""
-    repaired: bool = False
+def validate_json_schema(schema: dict[str, Any]) -> None:
+    """Validate a child-agent output schema before launching the child.
 
-    def snapshot(self) -> dict[str, Any]:
-        data = {
-            "status": self.status,
-            "mode": self.mode,
-            "attempts": self.attempts,
-            "repaired": self.repaired,
-        }
-        if self.raw_preview:
-            data["raw_preview"] = self.raw_preview
-        if self.error:
-            data["error"] = self.error
-        return data
-
-
-def build_schema_instruction(schema: dict[str, Any]) -> str:
-    return (
-        "\n\nStructured output required:\n"
-        "- Return exactly one JSON value that validates against the JSON Schema below.\n"
-        "- Do not include prose, markdown fences, comments, or trailing text.\n"
-        "- Preserve the schema's required keys and primitive value types.\n\n"
-        "JSON Schema:\n"
-        f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}"
-    )
-
-
-def build_response_format_overrides(schema: dict[str, Any], *, name: str = "workflow_structured_output") -> dict[str, Any]:
-    return {
-        "extra_body": {
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": _safe_schema_name(name),
-                    "schema": schema,
-                    "strict": False,
-                },
-            }
-        }
-    }
-
-
-def parse_structured_output(value: Any, schema: dict[str, Any]) -> Any:
-    parsed = value if not isinstance(value, str) else parse_jsonish(value)
-    validate_schema(parsed, schema)
-    return parsed
-
-
-def parse_jsonish(text: str) -> Any:
-    stripped = text.strip()
-    if not stripped:
-        raise StructuredOutputError("child agent returned empty structured output")
+    With the optional ``jsonschema`` dependency installed, this uses the same
+    Draft 2020-12 validator that runtime output validation uses. Directory
+    plugin installs may not have dependencies installed, so the fallback accepts
+    only the JSON Schema subset that this module can enforce itself.
+    """
     try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
+        from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+
+        Draft202012Validator.check_schema(schema)
+        return
+    except ImportError:
         pass
+    except Exception as exc:
+        message = getattr(exc, "message", str(exc))
+        raise StructuredOutputError(f"invalid JSON Schema: {message}") from exc
 
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", stripped, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        try:
-            return json.loads(fenced.group(1).strip())
-        except json.JSONDecodeError:
-            pass
-
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(stripped):
-        if char not in "{[":
-            continue
-        try:
-            value, _ = decoder.raw_decode(stripped[index:])
-            return value
-        except json.JSONDecodeError:
-            continue
-    raise StructuredOutputError("child agent did not return valid JSON")
+    _validate_fallback_schema(schema, path="root")
 
 
 def validate_schema(value: Any, schema: dict[str, Any]) -> None:
@@ -112,34 +49,93 @@ def validate_schema(value: Any, schema: dict[str, Any]) -> None:
     _validate_fallback(value, schema, path="$")
 
 
-def build_repair_prompt(raw_text: Any, error: str, schema: dict[str, Any]) -> str:
-    raw = raw_text if isinstance(raw_text, str) else json.dumps(raw_text, ensure_ascii=False, default=str)
-    return (
-        "Repair the child agent's final answer into valid JSON only.\n"
-        "Return exactly one JSON value. Do not include prose or markdown fences.\n\n"
-        f"Validation error:\n{error}\n\n"
-        "JSON Schema:\n"
-        f"{json.dumps(schema, ensure_ascii=False, sort_keys=True)}\n\n"
-        "Original answer:\n"
-        f"{raw}"
-    )
+_FALLBACK_UNSUPPORTED_KEYWORDS = {
+    "$dynamicRef",
+    "$recursiveRef",
+    "$ref",
+    "contains",
+    "dependentRequired",
+    "dependentSchemas",
+    "else",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "if",
+    "maxContains",
+    "maxProperties",
+    "minContains",
+    "minProperties",
+    "multipleOf",
+    "not",
+    "patternProperties",
+    "prefixItems",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "uniqueItems",
+}
 
 
-def looks_like_response_format_error(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    if "response_format" not in text and "json_schema" not in text:
-        return False
-    markers = (
-        "unsupported",
-        "not supported",
-        "unknown",
-        "unrecognized",
-        "invalid",
-        "400",
-        "bad request",
-        "extra_body",
-    )
-    return any(marker in text for marker in markers)
+def _validate_fallback_schema(schema: Any, *, path: str) -> None:
+    if schema is True or schema is False:
+        return
+    if not isinstance(schema, dict):
+        raise StructuredOutputError(
+            f"invalid JSON Schema: {path}: schema must be an object or boolean"
+        )
+
+    for keyword in sorted(_FALLBACK_UNSUPPORTED_KEYWORDS.intersection(schema)):
+        raise StructuredOutputError(
+            "jsonschema package is not installed; "
+            f"schema keyword {keyword!r} at {path} requires full JSON Schema validation. "
+            'Install "jsonschema>=4,<5" in the Hermes Python environment or simplify the schema.'
+        )
+
+    expected_type = schema.get("type")
+    if expected_type is not None:
+        allowed_types = expected_type if isinstance(expected_type, list) else [expected_type]
+        if not allowed_types or not all(isinstance(item, str) for item in allowed_types):
+            raise StructuredOutputError(f"invalid JSON Schema: {path}.type must be a string or list")
+
+    required = schema.get("required")
+    if required is not None and (
+        not isinstance(required, list) or not all(isinstance(item, str) for item in required)
+    ):
+        raise StructuredOutputError(f"invalid JSON Schema: {path}.required must be a list of strings")
+
+    properties = schema.get("properties")
+    if properties is not None:
+        if not isinstance(properties, dict):
+            raise StructuredOutputError(f"invalid JSON Schema: {path}.properties must be an object")
+        for name, subschema in properties.items():
+            _validate_fallback_schema(subschema, path=f"{path}.properties.{name}")
+
+    additional = schema.get("additionalProperties")
+    if isinstance(additional, dict):
+        _validate_fallback_schema(additional, path=f"{path}.additionalProperties")
+    elif additional is not None and not isinstance(additional, bool):
+        raise StructuredOutputError(
+            f"invalid JSON Schema: {path}.additionalProperties must be a boolean or object"
+        )
+
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _validate_fallback_schema(items, path=f"{path}.items")
+    elif items is not None and not isinstance(items, bool):
+        raise StructuredOutputError(
+            "jsonschema package is not installed; "
+            f"{path}.items uses tuple/complex item validation. "
+            'Install "jsonschema>=4,<5" in the Hermes Python environment or simplify the schema.'
+        )
+
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        subschemas = schema.get(keyword)
+        if subschemas is None:
+            continue
+        if not isinstance(subschemas, list):
+            raise StructuredOutputError(f"invalid JSON Schema: {path}.{keyword} must be a list")
+        for index, subschema in enumerate(subschemas):
+            _validate_fallback_schema(subschema, path=f"{path}.{keyword}[{index}]")
 
 
 def _validate_fallback(value: Any, schema: Any, *, path: str) -> None:
@@ -262,8 +258,3 @@ def _matches_type(value: Any, type_name: str) -> bool:
         "boolean": isinstance(value, bool),
         "null": value is None,
     }.get(type_name, True)
-
-
-def _safe_schema_name(name: str) -> str:
-    clean = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")
-    return clean[:64] or "workflow_structured_output"
