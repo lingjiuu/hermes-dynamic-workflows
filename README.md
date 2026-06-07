@@ -8,6 +8,8 @@ of independent subagents with `agent()/parallel()/pipeline()` — ideal for code
 audits, large-scale migrations, and cross-validated research. Inspired by
 [Dynamic Workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code).
 
+https://github.com/user-attachments/assets/06ef3d0d-4d89-48c4-9851-e1cae690e9b0
+
 ## Quick Start
 
 Install and enable in one line:
