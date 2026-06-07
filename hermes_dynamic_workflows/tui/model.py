@@ -32,6 +32,7 @@ class AgentView:
     duration_seconds: float | None
     transcript_path: str
     activity: tuple[str, ...]
+    activity_total: int = 0
 
 
 @dataclass(frozen=True)
@@ -284,7 +285,7 @@ class WorkflowRepository:
         transcript_activity = _read_transcript_activity(agent.transcript_path, self._jsonl_reader)
         if not transcript_activity:
             return workflow
-        hydrated = replace(agent, activity=tuple(transcript_activity[-8:]))
+        hydrated = replace(agent, activity=tuple(transcript_activity[-8:]), activity_total=len(transcript_activity))
         phase_agents = tuple(
             hydrated if index == agent_index else item
             for index, item in enumerate(phase.agents)
@@ -370,6 +371,7 @@ def _agent_view(
         duration_seconds=_as_duration(agent.get("duration_seconds")),
         transcript_path=str(agent.get("transcript_path") or ""),
         activity=tuple((journal.get(agent_id) or [])[-8:]),
+        activity_total=_tool_count(journal.get(agent_id) or ()),
     )
 
 
@@ -552,6 +554,10 @@ def _as_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _tool_count(activity: tuple[str, ...] | list[str]) -> int:
+    return sum(1 for item in activity if item not in ("Agent started", "Result recorded"))
 
 
 def _as_duration(value: Any) -> float | None:

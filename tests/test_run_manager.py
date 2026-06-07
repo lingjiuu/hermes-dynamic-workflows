@@ -553,7 +553,7 @@ return await agent("inspect metadata", {"label": "meta-agent", "agentType": "res
         self.assertIn(final["runId"], overview)
         self.assertIn("meta-agent", overview)
         self.assertIn("test-model", overview)
-        self.assertIn("1.2K tok", overview)
+        self.assertIn("1.2K tokens", overview)
         self.assertIn("2.0K cached read", overview)
 
     def test_resume_reuses_parallel_results(self):

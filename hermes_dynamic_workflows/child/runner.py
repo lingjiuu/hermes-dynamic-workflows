@@ -1193,7 +1193,7 @@ def _child_metadata(
         "output_tokens": completion_tokens,
         "reasoning_tokens": reasoning_tokens,
         "tokens": prompt_tokens + completion_tokens + reasoning_tokens,
-        # Hermes auto-enables Anthropic prompt caching for Claude-family models
+        # Prompt caching is auto-enabled for supported models
         # (agent/prompt_caching.py). Children inherit it, so these counters show
         # how much each child reused vs wrote to the cache.
         "cache_read_tokens": _int_attr(child, "session_cache_read_tokens"),
@@ -1214,8 +1214,8 @@ def _tool_call_count(result: dict[str, Any]) -> int:
     Hermes' get_activity_summary() exposes api_call_count (LLM round-trips), not
     a tool-call count, so it is not a valid source here — using it reported a
     nonzero "tool calls" even for toolset=[] agents that just answered. Count
-    real tool calls from the result messages instead: OpenAI-style assistant
-    `tool_calls`, plus Anthropic-style `tool_use` content blocks.
+    real tool calls from the result messages: assistant `tool_calls` and
+    provider `tool_use` content blocks.
     """
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):

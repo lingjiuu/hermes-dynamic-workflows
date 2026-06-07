@@ -1,4 +1,4 @@
-"""Claude-Code-style structured output for workflow child agents."""
+"""Structured output for workflow child agents."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Parse Claude-style token targets from the user's current task."""
+"""Token budget parsing from a user directive."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ _MULTIPLIERS = {
 
 
 def parse_token_budget(text: str | None) -> int | None:
-    """Return the user's Claude-style token target, or ``None`` when absent."""
+    """Return the user's token budget target, or ``None`` when absent."""
     if not text:
         return None
     for pattern in (_SHORTHAND_START_RE, _SHORTHAND_END_RE, _VERBOSE_RE):

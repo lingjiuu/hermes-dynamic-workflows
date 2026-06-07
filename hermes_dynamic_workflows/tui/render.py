@@ -2,9 +2,8 @@
 
 Each rendered line is a list of ``Span`` (text + style key). The curses layer
 maps style keys to attributes/colors, so a single row can mix colors — e.g. a
-green status icon, a neutral name, and dim metrics — matching the Claude Code
-``/workflows`` panel. ``render_screen`` flattens spans to plain text for the
-non-interactive snapshot and the tests.
+green status icon, a neutral name, and dim metrics. ``render_screen`` flattens
+spans to plain text for the non-interactive snapshot and the tests.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from .model import AgentView, PhaseView, SessionGroup, WorkflowView, group_sessi
 _DETAIL_HEADER_LINES = 4
 _LIST_FOOTER = "↑/↓ to select · → in · ← out · Enter to open · x to stop · s to save · Esc to close"
 _WORKFLOW_FOOTER = "↑↓ select · → in · ← back · x stop · p pause · r restart · s save"
-_AGENT_FOOTER = "↑↓ agent · j/k scroll · x stop · p pause · r restart · s save · esc back"
+_AGENT_FOOTER = "↑↓ select · → detail · ← back · x stop · p pause · r restart · s save"
 
 
 @dataclass(frozen=True)
@@ -41,6 +40,7 @@ class RenderState:
     list_cursor: int = 0
     expanded: frozenset[str] = frozenset()
     focus: str = "phases"  # workflow view: "phases" (left) or "agents" (right)
+    prompt_expanded: bool = False
     message: str = ""
 
 
@@ -145,7 +145,7 @@ def _session_counts(group: SessionGroup) -> str:
 
 def _session_run_row(workflow: WorkflowView, selected: bool, width: int) -> Line:
     metrics = (
-        f"  {workflow.agent_count} agents · {_tokens(workflow.tokens)} tok · "
+        f"  {workflow.agent_count} agents · {_tokens(workflow.tokens)} tokens · "
         f"{_duration(workflow.duration_seconds)}"
     )
     return _crop_line(
@@ -206,20 +206,22 @@ def _render_workflow(workflow: WorkflowView, state: RenderState, width: int, hei
 def _render_agent(workflow: WorkflowView, state: RenderState, width: int, height: int) -> list[Line]:
     phase, agents, agent = _selected_agent(workflow, state)
     agent_index = _clamp(state.agent_index, len(agents))
+    focus_left = state.focus != "detail"
     progress = f"{workflow.done}/{workflow.agent_count} agents · {_duration(workflow.duration_seconds)}"
     header = _detail_header(workflow.name, workflow.description, progress, width)
     left_width, right_width, body_height = _agent_geometry(width, height)
 
     left: list[Line] = [
         [
-            _sp("❯ ", "sel") if index == agent_index else _sp("  "),
+            _sp("❯ ", "sel") if (index == agent_index and focus_left) else _sp("  "),
             _sp(_status_icon(item.status), _status_style(item.status)),
-            _sp(" " + item.label, "sel" if index == agent_index else ""),
+            _sp(" " + item.label, "sel" if (index == agent_index and focus_left) else ""),
         ]
         for index, item in enumerate(agents)
     ]
     left = _window_lines(left, agent_index, body_height)
-    right = _scroll_view(_agent_detail(agent, right_width), state.detail_scroll, body_height, right_width)
+    detail = _agent_detail(agent, right_width, prompt_expanded=state.prompt_expanded)
+    right = _scroll_view(detail, state.detail_scroll, body_height, right_width) if not focus_left else _pad_rows(detail, body_height)
 
     panel = _two_columns(
         f"{phase.title} · {len(agents)} agents", left,
@@ -227,6 +229,11 @@ def _render_agent(workflow: WorkflowView, state: RenderState, width: int, height
         left_width=left_width, right_width=right_width, height=body_height,
     )
     return header + panel + [_footer(_AGENT_FOOTER, state.message, width)]
+
+
+def _pad_rows(lines: list[Line], height: int) -> list[Line]:
+    visible = lines[:height]
+    return visible + [[] for _ in range(max(0, height - len(visible)))]
 
 
 def _detail_header(name: str, description: str, progress: str, width: int) -> list[Line]:
@@ -256,28 +263,39 @@ def _agent_geometry(width: int, height: int) -> tuple[int, int, int]:
     return left_width, right_width, body_height
 
 
-def _agent_detail(agent: AgentView | None, width: int) -> list[Line]:
+def _agent_detail(agent: AgentView | None, width: int, *, prompt_expanded: bool = False) -> list[Line]:
     if agent is None:
         return [[_sp("No agents in this phase.", "dim")]]
     inner = max(8, width - 2)
-    metrics = f"{_tokens(agent.tokens)} tok · {agent.tool_calls} tool calls"
+    status_icon = _status_icon(agent.status)
+    metrics = f"{_tokens(agent.tokens)} tokens · {agent.tool_calls} tool calls"
     if agent.duration_seconds is not None:
         metrics += f" · {_duration(agent.duration_seconds)}"
     lines: list[Line] = [
-        [_sp(_status_label(agent.status), _status_style(agent.status))]
+        [_sp(status_icon + " ", _status_style(agent.status)), _sp(_status_label(agent.status), _status_style(agent.status))]
         + ([_sp(f" · {agent.model}", "dim")] if agent.model else []),
         [_sp(metrics, "dim")],
         [],
-        [_sp(f"Prompt · {max(1, len(agent.prompt.splitlines()))} lines", "dim")],
     ]
-    preview, hidden = _clip(_wrapped_block(agent.prompt, inner), 6)
-    lines.extend([_sp("  " + item)] for item in preview)
-    if hidden:
-        lines.append([_sp(f"  … {hidden} more line{'s' if hidden != 1 else ''}", "dim")])
+    prompt_wrapped = _wrapped_block(agent.prompt, inner)
+    prompt_total = max(1, len(prompt_wrapped))
+    if prompt_expanded:
+        lines.append([_sp(f"Prompt · {prompt_total} lines · ⏎ collapse", "dim")])
+        lines.extend([_sp("  " + item)] for item in prompt_wrapped)
+    else:
+        preview, hidden = _clip(prompt_wrapped, 6)
+        hint = f" · ⏎ expand" if hidden else ""
+        lines.append([_sp(f"Prompt · {prompt_total} lines{hint}", "dim")])
+        lines.extend([_sp("  " + item)] for item in preview)
+        if hidden:
+            lines.append([_sp(f"  … {hidden} more lines", "dim")])
+    # activity: only tool-call events, filter out "Agent started"/"Result recorded"
+    tool_items = [item for item in agent.activity if item not in ("Agent started", "Result recorded")]
     lines.append([])
-    lines.append([_sp(f"Activity · last {min(6, len(agent.activity))} of {len(agent.activity)}", "dim")])
-    if agent.activity:
-        lines.extend([_sp("  " + _crop(item, inner))] for item in agent.activity[-6:])
+    total_tools = agent.activity_total if agent.activity_total else len(tool_items)
+    lines.append([_sp(f"Activity · last {min(6, len(tool_items))} of {total_tools}", "dim")])
+    if tool_items:
+        lines.extend([_sp("  " + _tool_call_text(item, inner))] for item in tool_items[-6:])
     else:
         lines.append([_sp("  No tool activity yet", "dim")])
     lines.append([])
@@ -292,7 +310,7 @@ def agent_detail_scroll_max(workflow: WorkflowView, state: RenderState, width: i
     height = max(12, height)
     _phase, _agents, agent = _selected_agent(workflow, state)
     _left_width, right_width, body_height = _agent_geometry(width, height)
-    return _max_scroll(len(_agent_detail(agent, right_width)), body_height)
+    return _max_scroll(len(_agent_detail(agent, right_width, prompt_expanded=state.prompt_expanded)), body_height)
 
 
 def _max_scroll(total: int, height: int) -> int:
@@ -321,7 +339,7 @@ def _agent_row(agent: AgentView, width: int, *, selected: bool = False) -> Line:
         _sp(_status_icon(agent.status), _status_style(agent.status)),
         _sp(" " + agent.label, "sel" if selected else ""),
     ]
-    metrics = f"{_tokens(agent.tokens)} tok · {agent.tool_calls} tools"
+    metrics = f"{_tokens(agent.tokens)} tokens · {agent.tool_calls} tools"
     if agent.duration_seconds is not None:
         metrics += f" · {_duration(agent.duration_seconds)}"
     right: Line = []
@@ -348,9 +366,9 @@ def _two_columns(
     divider = _sp(" │ ", "divider")
     heading = (
         [_sp("  ")]
-        + _pad_line(_crop_line([_sp(left_title, "dim")], left_width), left_width)
+        + _pad_line(_crop_line([_sp(left_title, "title")], left_width), left_width)
         + [divider]
-        + _crop_line([_sp(right_title, "dim")], right_width)
+        + _crop_line([_sp(right_title, "title")], right_width)
     )
     out: list[Line] = [heading]
     for index in range(height):
@@ -477,6 +495,36 @@ def _clip(lines: list[str], max_lines: int) -> tuple[list[str], int]:
     if len(lines) <= max_lines:
         return lines, 0
     return lines[:max_lines], len(lines) - max_lines
+
+
+def _tool_call_text(line: str, width: int) -> str:
+    """Show a tool-call activity line compactly.
+
+    Short calls fit as-is. Long calls keep the tool name and the closing ``)``,
+    compressing arguments to ``…`` so the structure stays readable."""
+    if _display_width(line) <= width:
+        return line
+    paren = line.find("(")
+    if paren < 0:
+        return _crop(line, width)
+    tool = line[:paren + 1]  # "terminal(" — always keep the name and open paren
+    # keep as much of the arguments as fits, but reserve room for …)
+    suffix = "…)"
+    suffix_width = _display_width(suffix)
+    budget = width - _display_width(tool) - suffix_width
+    if budget <= 0:
+        # tool name alone already overflows: crop the name and append …)
+        return _crop(tool, width - suffix_width) + suffix
+    args = line[paren + 1:]
+    visible = ""
+    w = 0
+    for ch in args:
+        cw = _char_width(ch)
+        if w + cw > budget:
+            break
+        visible += ch
+        w += cw
+    return tool + visible + suffix
 
 
 def _crop(text: str, width: int) -> str:

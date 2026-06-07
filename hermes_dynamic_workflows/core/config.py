@@ -34,8 +34,8 @@ class PluginConfig:
         "messaging",
         "clarify",
     )
-    # Per-agent model override (agent(model=...)) is allowed by default, matching
-    # Claude Code's per-agent / per-stage model routing; the default is still the
+    # Per-agent model override (agent(model=...)) is allowed by default,
+    # matching per-agent / per-stage model routing; the default is still the
     # session model, override only when a stage wants a different tier. Provider
     # selection stays in Hermes' runtime/model configuration.
     allow_model_override: bool = True
@@ -69,7 +69,7 @@ class PluginConfig:
     # detached workflow child). smart | deny | approve.
     ask_fallback: str = "smart"
     # On run completion, notify the parent session so the user does not need to
-    # poll /workflows. CLI receives a Claude-Code-style <task-notification>
+    # poll /workflows. A <task-notification> is injected into the conversation
     # through ctx.inject_message; gateway sends a concise completion message to
     # the originating chat. Result previews are truncated to
     # notify_result_preview_chars to protect context/chat length.

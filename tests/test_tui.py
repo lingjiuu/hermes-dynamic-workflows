@@ -118,10 +118,10 @@ class TuiTests(unittest.TestCase):
             base = WorkflowRepository(_fake_store(Path(tmp))).detail("wf_fake-completed")
         agent = replace(base.agents[0], outcome="\n".join(f"line {i}" for i in range(60)))
         wf = replace(base, agents=(agent,), phases=(PhaseView(title="Search", agents=(agent,)),))
-        top = "\n".join(render_screen([wf], RenderState(view="agent"), width=100, height=20))
+        top = "\n".join(render_screen([wf], RenderState(view="agent", focus="detail"), width=100, height=20))
         self.assertRegex(top, r"1-\d+ of \d+ ↓")
         self.assertIn("line 0", top)
-        bottom = "\n".join(render_screen([wf], RenderState(view="agent", detail_scroll=999), width=100, height=20))
+        bottom = "\n".join(render_screen([wf], RenderState(view="agent", focus="detail", detail_scroll=999), width=100, height=20))
         self.assertRegex(bottom, r"of \d+ ↑")
         self.assertIn("line 59", bottom)
         self.assertNotIn("line 0", bottom)
@@ -214,17 +214,18 @@ class TuiTests(unittest.TestCase):
             controller.handle_key("down")   # session header -> its workflow row
             controller.handle_key("enter")  # open workflow (focus: phases)
             controller.handle_key("right")  # focus the agents pane
-            controller.handle_key("enter")  # open agent
+            controller.handle_key("enter")  # open agent view (focus=agents)
             self.assertEqual(controller.state.view, "agent")
-            controller.handle_key("j")
-            controller.handle_key("j")
-            self.assertEqual(controller.state.detail_scroll, 2)
-            # The selected agent's detail fits this viewport, so frame() clamps to 0.
-            controller.frame(120, 40)
-            self.assertEqual(controller.state.detail_scroll, 0)
-            controller.handle_key("j")
-            self.assertEqual(controller.state.detail_scroll, 1)
+            controller.handle_key("right")  # switch focus to detail panel
+            self.assertEqual(controller.state.focus, "detail")
+            controller.handle_key("down")   # ↓ scrolls the detail
             controller.handle_key("down")
+            self.assertEqual(controller.state.detail_scroll, 2)
+            controller.frame(120, 40)       # clamps if content fits
+            self.assertEqual(controller.state.detail_scroll, 0)
+            controller.handle_key("down")
+            self.assertEqual(controller.state.detail_scroll, 1)
+            controller.handle_key("up")
             self.assertEqual(controller.state.detail_scroll, 0)
 
     def test_controller_navigation_save_and_refresh(self):

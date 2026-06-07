@@ -1,4 +1,4 @@
-"""Claude-style background task stop tool for workflow runs."""
+"""Background task stop tool for workflow runs."""
 
 from __future__ import annotations
 

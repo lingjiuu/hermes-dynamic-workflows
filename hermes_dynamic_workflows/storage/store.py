@@ -242,7 +242,7 @@ def default_layout_root() -> Path:
 
 
 def sanitize_path(value: str) -> str:
-    """Claude-Code-style project directory key: non-alnum characters become '-'."""
+    """Project directory key: non-alnum characters become '-'."""
 
     raw = str(value or "").strip() or "unknown-cwd"
     sanitized = re.sub(r"[^a-zA-Z0-9]", "-", raw)

@@ -44,7 +44,7 @@ def render_agent_overview(runs: list[dict[str, Any]], *, max_agents_per_run: int
         if totals["running"]:
             status_line += f" . {totals['running']} running"
         status_line += (
-            f" . {_format_tokens(totals['tokens'])} tok . "
+            f" . {_format_tokens(totals['tokens'])} tokens . "
             f"{_format_duration(_duration(run, snapshot))} . {run.get('status')}"
         )
         task_id = str(run.get("taskId") or "")

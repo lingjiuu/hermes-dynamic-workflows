@@ -111,10 +111,6 @@ class TuiController:
             self._control("resume" if target and target.status == "paused" else "pause")
         elif key in {"r", "R"}:
             self._control("restart")
-        elif key in {"j", "J"}:
-            self._scroll_detail(1)
-        elif key in {"k", "K"}:
-            self._scroll_detail(-1)
 
     def _detail_view(self) -> WorkflowView | None:
         """Full (agents/phases) view for the open run; built on demand, cached."""
@@ -141,8 +137,6 @@ class TuiController:
         return render_styled(self.workflows, self.state, width=width, height=height, groups=self.groups)
 
     def _scroll_detail(self, delta: int) -> None:
-        if self.state.view != "agent":
-            return
         self.state = replace(
             self.state,
             detail_scroll=max(0, self.state.detail_scroll + delta),
@@ -173,12 +167,16 @@ class TuiController:
                     message="",
                 )
         elif self.state.view == "agent":
-            self.state = replace(
-                self.state,
-                agent_index=_clamp(self.state.agent_index + delta, len(self._current_phase_agents())),
-                detail_scroll=0,
-                message="",
-            )
+            if self.state.focus == "detail":
+                self._scroll_detail(delta)
+            else:
+                self.state = replace(
+                    self.state,
+                    agent_index=_clamp(self.state.agent_index + delta, len(self._current_phase_agents())),
+                    detail_scroll=0,
+                    prompt_expanded=False,
+                    message="",
+                )
 
     def _expand(self) -> None:
         item = self._cursor_item()
@@ -221,20 +219,29 @@ class TuiController:
             self._open_run(group_index, run_index)
         elif self.state.view == "workflow":
             if self.state.focus == "agents":
-                agents = self._current_phase_agents()
-                if agents:
-                    self.state = replace(self.state, view="agent", detail_scroll=0, message="")
+                # drill into the agent view
+                self.state = replace(self.state, view="agent", focus="agents", detail_scroll=0, message="")
                 return
-            # left pane: step into the right (agents) pane, don't drill yet
+            # left pane: step into the right (agents) pane
             agents = self._current_phase_agents()
             if not agents:
                 self.state = replace(self.state, message="This phase has no agents yet.")
                 return
             self.state = replace(self.state, focus="agents", agent_index=0, message="")
+        elif self.state.view == "agent":
+            if self.state.focus == "agents":
+                self.state = replace(self.state, focus="detail", prompt_expanded=False, message="")
+            else:
+                # focus on detail: Enter toggles prompt expand/collapse
+                self.state = replace(self.state, prompt_expanded=not self.state.prompt_expanded, message="")
 
     def _back(self) -> None:
         if self.state.view == "agent":
-            self.state = replace(self.state, view="workflow", focus="agents", detail_scroll=0, message="")
+            if self.state.focus == "detail":
+                # back to the left agent list
+                self.state = replace(self.state, focus="agents", prompt_expanded=False, message="")
+            else:
+                self.state = replace(self.state, view="workflow", focus="agents", detail_scroll=0, prompt_expanded=False, message="")
         elif self.state.view == "workflow":
             if self.state.focus == "agents":
                 self.state = replace(self.state, focus="phases", message="")

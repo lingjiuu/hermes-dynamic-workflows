@@ -271,11 +271,11 @@ class WorkflowRunManager:
         return None
 
     def stop_task(self, task_id: str) -> dict[str, Any] | None:
-        """Stop an active background workflow by Claude-style task id.
+        """Stop an active background workflow by its task id.
 
         This intentionally only checks live managed runs. Historical runs in
         state are not stoppable tasks, so stopping a completed or already
-        stopped task should look like Claude Code's "No task found" result.
+        stopped task should return a "No task found" result.
         """
         wanted = str(task_id or "")
         if not wanted:
@@ -1089,7 +1089,7 @@ def _notify_completion(
     config: PluginConfig,
     session_context: dict[str, str] | None = None,
 ) -> None:
-    """On terminal state, inject a Claude-Code-style <task-notification> into the
+    """On terminal state, inject a <task-notification> into the
     conversation so the model can deliver the result without the user polling
     /workflows. In gateway mode, where CLI injection is unavailable after the
     parent turn returns, send a concise completion message to the origin chat.
@@ -1242,8 +1242,8 @@ def _render_gateway_completion_message(record: dict[str, Any], config: PluginCon
 
 
 def _render_task_notification(record: dict[str, Any], preview_chars: int) -> str:
-    """Mirror Claude Code's LocalAgentTask task-notification block, adapted to a
-    workflow run (tool_uses -> agents, plus errors)."""
+    """Build a task-notification block adapted to a workflow run (tool_uses
+    mapped to agents, plus errors)."""
     run_id = record.get("runId") or ""
     task_id = record.get("taskId") or run_id
     status = str(record.get("status") or "completed")
