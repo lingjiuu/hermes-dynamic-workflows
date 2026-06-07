@@ -5,6 +5,7 @@ description = "Claude-Code-style dynamic workflows for Hermes Agent"
 requires-python = ">=3.11"
 dependencies = [
     "jsonschema>=4,<5",
+    "wcwidth>=0.2,<1",
     "windows-curses>=2.4; platform_system == 'Windows'",
 ]
 

@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 import threading
+import unicodedata
 import uuid
 import logging
 from contextlib import nullcontext
@@ -32,6 +33,11 @@ from .structured_output import (
     structured_output_tool_scope,
 )
 from ..core.types import ChildAgentRequest, ChildAgentResult, ChildAgentRunner
+
+try:
+    from wcwidth import wcswidth as _wcswidth
+except ImportError:
+    _wcswidth = None
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +335,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
             "quiet_mode": True,
             "platform": "cli",
             "tool_progress_callback": self._make_tool_progress_callback(request, lease),
+            "thinking_callback": _child_thinking_callback,
             "skip_context_files": True,
             "skip_memory": True,
             "clarify_callback": _child_clarify_callback,
@@ -824,6 +831,10 @@ def _child_clarify_callback(question: str, choices=None) -> str:
     )
 
 
+def _child_thinking_callback(_text: str) -> None:
+    """Prevent quiet workflow children from starting raw stdout spinners."""
+
+
 _TOOL_ARG_PRIORITY = (
     "query",
     "path",
@@ -860,9 +871,29 @@ def _compact_tool_progress_line(
     compact_args = _compact_tool_args(args)
     suffix = f"({compact_args})" if compact_args else ""
     line = f"↳ {clean_label} · {clean_tool}{suffix}"
-    if max_width is not None:
-        line = _ellipsize_middle(line, max_width)
-    return line
+    if max_width is None or _display_width(line) <= max_width:
+        return line
+
+    reserved_args_width = _display_width("(...)") if compact_args else 0
+    static_width = _display_width(f"↳  · {clean_tool}") + reserved_args_width
+    label_width = max(1, max_width - static_width)
+    if label_width == 1 and static_width >= max_width:
+        tool_width = max(
+            1,
+            max_width - _display_width("↳  · ") - reserved_args_width - 1,
+        )
+        clean_tool = _ellipsize_display_middle(clean_tool, tool_width)
+        static_width = _display_width(f"↳  · {clean_tool}") + reserved_args_width
+        label_width = max(1, max_width - static_width)
+
+    clean_label = _ellipsize_display_middle(clean_label, label_width)
+    prefix = f"↳ {clean_label} · {clean_tool}"
+    if not compact_args:
+        return _ellipsize_display_middle(prefix, max_width)
+
+    args_width = max(1, max_width - _display_width(prefix) - _display_width("()"))
+    compact_args = _ellipsize_display_middle(compact_args, args_width)
+    return _ellipsize_display_middle(f"{prefix}({compact_args})", max_width)
 
 
 def _tool_progress_line_width() -> int:
@@ -870,7 +901,7 @@ def _tool_progress_line_width() -> int:
         columns = shutil.get_terminal_size((_TOOL_PROGRESS_FALLBACK_WIDTH, 24)).columns
     except (OSError, ValueError):
         columns = _TOOL_PROGRESS_FALLBACK_WIDTH
-    return max(40, min(int(columns) - 1, _TOOL_PROGRESS_MAX_WIDTH))
+    return max(1, min(int(columns) - 2, _TOOL_PROGRESS_MAX_WIDTH))
 
 
 def _write_tool_progress_line(line: str) -> None:
@@ -904,7 +935,9 @@ def _compact_tool_args(args: Any) -> str:
 
 def _compact_tool_arg_value(value: Any) -> str:
     if isinstance(value, str):
-        return _quote_display_string(_ellipsize_middle(_single_line(value), _TOOL_ARG_VALUE_LIMIT))
+        return _quote_display_string(
+            _ellipsize_display_middle(_single_line(value), _TOOL_ARG_VALUE_LIMIT)
+        )
     if isinstance(value, bool):
         return "true" if value else "false"
     if value is None:
@@ -915,7 +948,9 @@ def _compact_tool_arg_value(value: Any) -> str:
         return "{...}"
     if isinstance(value, (list, tuple, set)):
         return "[...]"
-    return _quote_display_string(_ellipsize_middle(_single_line(str(value)), _TOOL_ARG_VALUE_LIMIT))
+    return _quote_display_string(
+        _ellipsize_display_middle(_single_line(str(value)), _TOOL_ARG_VALUE_LIMIT)
+    )
 
 
 def _quote_display_string(value: str) -> str:
@@ -927,15 +962,53 @@ def _single_line(value: str) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def _ellipsize_middle(value: str, limit: int) -> str:
-    if len(value) <= limit:
+def _display_width(value: str) -> int:
+    if _wcswidth is not None:
+        width = _wcswidth(value)
+        if width >= 0:
+            return width
+    width = 0
+    for char in value:
+        category = unicodedata.category(char)
+        if unicodedata.combining(char) or category in {"Cc", "Cf", "Mn", "Me"}:
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def _take_display_prefix(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    end = 0
+    for index in range(1, len(value) + 1):
+        if _display_width(value[:index]) > limit:
+            break
+        end = index
+    return value[:end]
+
+
+def _take_display_suffix(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    start = len(value)
+    for index in range(len(value) - 1, -1, -1):
+        if _display_width(value[index:]) > limit:
+            break
+        start = index
+    return value[start:]
+
+
+def _ellipsize_display_middle(value: str, limit: int) -> str:
+    if _display_width(value) <= limit:
         return value
     if limit <= 3:
         return "." * max(0, limit)
     keep = max(1, limit - 3)
-    head = (keep + 1) // 2
-    tail = keep // 2
-    return f"{value[:head]}...{value[-tail:]}"
+    head_width = (keep + 1) // 2
+    tail_width = keep // 2
+    head = _take_display_prefix(value, head_width)
+    tail = _take_display_suffix(value, tail_width)
+    return f"{head}...{tail}"
 
 
 def _child_failure_message(result: Any, content: str) -> str | None:

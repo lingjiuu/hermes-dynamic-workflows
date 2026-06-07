@@ -42,9 +42,13 @@ def register(ctx) -> None:
     # commands even in non-CLI contexts (where Hermes would otherwise
     # auto-approve/orphan). In CLI this defers to the per-thread callback.
     ctx.register_hook("pre_tool_call", pre_tool_call_handler)
+
+    def _workflows_handler(raw_args: str = "", **_kwargs):
+        return workflows_command(raw_args, plugin_context=ctx)
+
     ctx.register_command(
         name="workflows",
-        handler=workflows_command,
+        handler=_workflows_handler,
         description="Show a compact overview of dynamic workflow agents.",
         args_hint="",
     )

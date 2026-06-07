@@ -329,8 +329,11 @@ class WorkflowRunManager:
             return bool(runner.skip_child(child_wanted))
         return False
 
-    def list(self, limit: int = 20) -> list[dict[str, Any]]:
-        return [self._public_record(run) for run in self.store.list_runs(limit=limit)]
+    def list(self, limit: int = 20, *, session_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            self._public_record(run)
+            for run in self.store.list_runs(limit=limit, session_id=session_id)
+        ]
 
     def stop(self, run_id: str) -> bool:
         with self._lock:
@@ -462,8 +465,8 @@ class WorkflowRunManager:
             }
         return {"ok": False, "action": action, "runId": run_id, "message": f"Unsupported control action: {action}"}
 
-    def format_agent_overview(self, limit: int = 12) -> str:
-        runs = self.list(limit=limit)
+    def format_agent_overview(self, limit: int = 12, *, session_id: str | None = None) -> str:
+        runs = self.list(limit=limit, session_id=session_id)
         return render_agent_overview(runs)
 
     def _script_path_for_source(

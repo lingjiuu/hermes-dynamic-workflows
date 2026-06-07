@@ -138,11 +138,12 @@ class WorkflowStore:
             return paths
         return paths[: max(0, limit)]
 
-    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 20, *, session_id: str | None = None) -> list[dict[str, Any]]:
+        wanted_session = str(session_id or "").strip()
         runs: list[dict[str, Any]] = []
         for path in self.list_run_paths(limit=None):
             data = self.load_run(path.stem)
-            if data:
+            if data and (not wanted_session or str(data.get("workflowSessionId") or "").strip() == wanted_session):
                 runs.append(data)
             if len(runs) >= limit:
                 break

@@ -19,11 +19,13 @@ from hermes_dynamic_workflows.child.runner import (
     _child_failure_message,
     _child_metadata,
     _compact_tool_progress_line,
+    _display_width,
     _apply_agent_type_defaults,
     _configure_child_tools,
     _discoverable_child_toolsets,
     _make_child_approval_callback,
     _resolve_child_toolsets,
+    _tool_progress_line_width,
     _tool_call_count,
 )
 from hermes_dynamic_workflows.child.worktree import WorkspaceLease, create_workspace_lease
@@ -604,9 +606,48 @@ class ToolCallCountTests(unittest.TestCase):
             max_width=72,
         )
 
-        self.assertLessEqual(len(line), 72)
+        self.assertLessEqual(_display_width(line), 72)
+        self.assertTrue(line.startswith("↳ 综合搜索 · structured_output("))
         self.assertIn("...", line)
         self.assertNotIn("\n", line)
+
+    def test_compact_tool_progress_line_handles_wide_label_and_emoji(self):
+        line = _compact_tool_progress_line(
+            "Agent 核心技术突破 🔍",
+            "terminal",
+            {
+                "command": (
+                    'curl -sL "https://lite.duckduckgo.com/lite/?q=agent+research" '
+                    "| grep result-snippet | head -100"
+                )
+            },
+            max_width=40,
+        )
+
+        self.assertLessEqual(_display_width(line), 40)
+        self.assertTrue(line.startswith("↳ Agent 核心技术突破 🔍 · terminal("))
+        self.assertIn("terminal(c...)", line)
+        self.assertNotIn("\n", line)
+
+    def test_compact_tool_progress_line_truncates_label_only_when_prefix_is_too_wide(self):
+        line = _compact_tool_progress_line(
+            "这是一个非常非常长的工作流子代理名称",
+            "structured_output",
+            {"name": "result"},
+            max_width=40,
+        )
+
+        self.assertLessEqual(_display_width(line), 40)
+        self.assertTrue(line.startswith("↳ 这是...名称"))
+        self.assertIn(" · structured_output(", line)
+        self.assertNotIn("\n", line)
+
+    def test_tool_progress_line_width_respects_narrow_terminal(self):
+        with patch(
+            "hermes_dynamic_workflows.child.runner.shutil.get_terminal_size",
+            return_value=os.terminal_size((30, 24)),
+        ):
+            self.assertEqual(_tool_progress_line_width(), 28)
 
     def test_child_agent_installs_compact_tool_progress_callback(self):
         seen_kwargs = {}
@@ -636,6 +677,8 @@ class ToolCallCountTests(unittest.TestCase):
         self.assertEqual(seen_kwargs["quiet_mode"], True)
         self.assertEqual(seen_kwargs["platform"], "cli")
         self.assertTrue(callable(seen_kwargs["tool_progress_callback"]))
+        self.assertTrue(callable(seen_kwargs["thinking_callback"]))
+        self.assertIsNone(seen_kwargs["thinking_callback"]("pondering..."))
 
     def test_tool_progress_callback_prints_one_started_line_on_tty(self):
         class TtyStringIO(io.StringIO):
