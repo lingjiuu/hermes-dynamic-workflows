@@ -128,9 +128,19 @@ class WorkflowStore:
             return None
         return data if isinstance(data, dict) else None
 
+    def list_run_paths(self, limit: int | None = 20) -> list[Path]:
+        paths = sorted(
+            self.runs_dir.glob("wf_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if limit is None:
+            return paths
+        return paths[: max(0, limit)]
+
     def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         runs: list[dict[str, Any]] = []
-        for path in sorted(self.runs_dir.glob("wf_*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for path in self.list_run_paths(limit=None):
             data = self.load_run(path.stem)
             if data:
                 runs.append(data)

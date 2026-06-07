@@ -36,12 +36,20 @@ class AgentRecord:
     attempts: int = 0
     structured: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.started_at is None:
+            return None
+        end = self.ended_at if self.ended_at is not None else monotonic()
+        return round(max(0.0, end - self.started_at), 3)
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "label": self.label,
             "phase": self.phase,
             "status": self.status,
+            "duration_seconds": self.duration_seconds,
             "prompt": self.prompt,
             "prompt_preview": self.prompt_preview,
             "result_preview": self.result_preview,

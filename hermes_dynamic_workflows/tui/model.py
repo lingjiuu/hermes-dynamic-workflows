@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from ..storage.store import WorkflowStore
 
 
 ACTIVE_STATUSES = frozenset({"queued", "running", "paused", "stopping"})
+TERMINAL_FAILURE_STATUSES = frozenset({"failed", "error", "stopped"})
 JSONL_TAIL_BYTES = 256 * 1024
 
 
@@ -27,6 +29,7 @@ class AgentView:
     model: str
     tokens: int
     tool_calls: int
+    duration_seconds: float | None
     transcript_path: str
     activity: tuple[str, ...]
 
@@ -51,6 +54,7 @@ class WorkflowView:
     current_phase: str
     phases: tuple[PhaseView, ...]
     agents: tuple[AgentView, ...]
+    agent_count: int
     tokens: int
     tool_calls: int
     duration_seconds: float
@@ -64,6 +68,115 @@ class WorkflowView:
     def running(self) -> bool:
         return self.status in ACTIVE_STATUSES
 
+    @property
+    def session_id(self) -> str:
+        return str(self.record.get("workflowSessionId") or "").strip()
+
+    @property
+    def cwd(self) -> str:
+        return str(self.record.get("cwd") or "").strip()
+
+    @property
+    def started_iso(self) -> str:
+        return str(self.record.get("startedAt") or self.record.get("createdAt") or "")
+
+
+@dataclass(frozen=True)
+class SessionGroup:
+    """A set of workflow runs that belong to the same Hermes session."""
+
+    key: str
+    cwd: str
+    project: str
+    ago: str
+    latest: float
+    workflows: tuple[WorkflowView, ...]
+    running: int
+    done: int
+    failed: int
+    is_current: bool = False
+
+
+def group_sessions(workflows: list[WorkflowView], *, now: datetime | None = None) -> list[SessionGroup]:
+    """Bucket runs by Hermes session, newest session first.
+
+    Runs without a session id (legacy iterations) are dropped. The "current"
+    session is HERMES_SESSION_ID if set, else the most recent session with an
+    active run, else the most recently active session overall.
+    """
+    moment = now or datetime.now(timezone.utc)
+    buckets: dict[str, list[WorkflowView]] = {}
+    order: list[str] = []
+    for workflow in workflows:
+        key = workflow.session_id
+        if not key:
+            continue
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(workflow)
+
+    groups: list[SessionGroup] = []
+    for key in order:
+        runs = buckets[key]
+        latest_iso = max((run.started_iso for run in runs), default="")
+        latest_dt = _parse_iso(latest_iso)
+        groups.append(
+            SessionGroup(
+                key=key,
+                cwd=runs[0].cwd,
+                project=_project_name(runs[0].cwd) or "workflow",
+                ago=_relative_time(latest_dt, moment),
+                latest=latest_dt.timestamp() if latest_dt else 0.0,
+                workflows=tuple(runs),
+                running=sum(run.running for run in runs),
+                done=sum(run.status == "completed" for run in runs),
+                failed=sum(run.status in TERMINAL_FAILURE_STATUSES for run in runs),
+            )
+        )
+    groups.sort(key=lambda group: group.latest, reverse=True)
+
+    current = _current_session_key(groups)
+    return [replace(group, is_current=group.key == current) for group in groups]
+
+
+def list_items(groups: list[SessionGroup], expanded: frozenset[str]) -> list[tuple[str, int, int]]:
+    """Flat selectable list for the accordion: ('group', gi, -1) and ('run', gi, ri)."""
+    items: list[tuple[str, int, int]] = []
+    for group_index, group in enumerate(groups):
+        items.append(("group", group_index, -1))
+        if group.key in expanded:
+            for run_index in range(len(group.workflows)):
+                items.append(("run", group_index, run_index))
+    return items
+
+
+def _current_session_key(groups: list[SessionGroup]) -> str:
+    env = os.getenv("HERMES_SESSION_ID", "").strip()
+    if env and any(group.key == env for group in groups):
+        return env
+    for group in groups:  # sorted newest-first
+        if group.running:
+            return group.key
+    return groups[0].key if groups else ""
+
+
+def _project_name(cwd: str) -> str:
+    return os.path.basename(cwd.rstrip("/")) if cwd else ""
+
+
+def _relative_time(when: datetime | None, now: datetime) -> str:
+    if when is None:
+        return "unknown"
+    seconds = max(0, int((now - when).total_seconds()))
+    if seconds < 45:
+        return "just now"
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
 
 class WorkflowRepository:
     """Reload workflow files on demand so another process can update the TUI."""
@@ -76,9 +189,66 @@ class WorkflowRepository:
         self.store = store or WorkflowStore()
         self.control_client = control_client or ControlClient(self.store)
         self._jsonl_reader = _JsonlTailReader()
+        # run_id -> (file signature, parsed view). Terminal runs never change, so
+        # parsing them once and serving from cache keeps the refresh loop cheap;
+        # active runs are always re-parsed so their live duration keeps ticking.
+        self._view_cache: dict[str, tuple[tuple[int, int], WorkflowView]] = {}
+        # Full (detail) views are heavier (agents/phases/journal) and only built
+        # when a workflow is opened — cached separately, same invalidation rule.
+        self._detail_cache: dict[str, tuple[tuple[int, int], WorkflowView]] = {}
+
+    def world_version(self) -> int:
+        """O(1) change token: the runs dir mtime bumps on every save_run (it
+        writes via tmp+rename), so this detects add/remove/rewrite at any scale."""
+        try:
+            return self.store.runs_dir.stat().st_mtime_ns
+        except OSError:
+            return 0
 
     def load(self, limit: int = 50) -> list[WorkflowView]:
-        return [workflow_view(run, jsonl_reader=self._jsonl_reader) for run in self.store.list_runs(limit=limit)]
+        views: list[WorkflowView] = []
+        seen: set[str] = set()
+        for path in self.store.list_run_paths(limit=limit):
+            run_id = path.stem
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature = (stat.st_mtime_ns, stat.st_size)
+            cached = self._view_cache.get(run_id)
+            if cached is not None and cached[0] == signature:
+                seen.add(run_id)
+                views.append(cached[1])
+                continue
+            record = self.store.load_run(run_id)
+            if not record:
+                continue
+            view = workflow_view(record, jsonl_reader=self._jsonl_reader, detail=False)
+            if view.status not in ACTIVE_STATUSES:
+                self._view_cache[run_id] = (signature, view)
+            seen.add(run_id)
+            views.append(view)
+        for stale in [run_id for run_id in self._view_cache if run_id not in seen]:
+            self._view_cache.pop(stale, None)
+        return views
+
+    def detail(self, run_id: str) -> WorkflowView | None:
+        """Full view (agents/phases/activity) for one run, built on demand."""
+        try:
+            stat = self.store.run_path(run_id).stat()
+        except (OSError, ValueError):
+            return None
+        signature = (stat.st_mtime_ns, stat.st_size)
+        cached = self._detail_cache.get(run_id)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        record = self.store.load_run(run_id)
+        if not record:
+            return None
+        view = workflow_view(record, jsonl_reader=self._jsonl_reader, detail=True)
+        if view.status not in ACTIVE_STATUSES:
+            self._detail_cache[run_id] = (signature, view)
+        return view
 
     def save_markdown(self, workflow: WorkflowView) -> Path:
         from ..view.render import render_saved_markdown
@@ -131,25 +301,35 @@ def workflow_view(
     record: dict[str, Any],
     *,
     jsonl_reader: "_JsonlTailReader | None" = None,
+    detail: bool = True,
 ) -> WorkflowView:
+    """Build a TUI view of a run.
+
+    With ``detail=False`` only the fields the list/groups need are populated
+    (name, status, counts, tokens, duration) — the per-agent ``AgentView``s,
+    phases, and journal reads are skipped, which is the bulk of the cost. Full
+    detail (agents/phases/activity) is built on demand when a workflow is opened.
+    """
     snapshot = record.get("workflow")
     if not isinstance(snapshot, dict):
         snapshot = {}
     meta = snapshot.get("meta")
     if not isinstance(meta, dict):
         meta = {}
-
-    reader = jsonl_reader or _JsonlTailReader()
-    journal = _read_journal(record.get("journalFile"), reader)
-    agents = tuple(
-        _agent_view(agent, journal)
-        for agent in _all_agents(snapshot)
-        if isinstance(agent, dict)
-    )
-    phases = _phase_views(snapshot, agents)
     totals = snapshot.get("totals")
     if not isinstance(totals, dict):
         totals = {}
+    raw_agents = [agent for agent in _all_agents(snapshot) if isinstance(agent, dict)]
+
+    if detail:
+        reader = jsonl_reader or _JsonlTailReader()
+        journal = _read_journal(record.get("journalFile"), reader)
+        outcomes = _journal_outcomes(record.get("journalFile"), reader)
+        agents = tuple(_agent_view(agent, journal, outcomes) for agent in raw_agents)
+        phases = _phase_views(snapshot, agents)
+    else:
+        agents = ()
+        phases = ()
 
     source = record.get("source") if isinstance(record.get("source"), dict) else {}
     return WorkflowView(
@@ -161,8 +341,9 @@ def workflow_view(
         current_phase=str(snapshot.get("current_phase") or ""),
         phases=phases,
         agents=agents,
-        tokens=_as_int(totals.get("tokens")) or sum(agent.tokens for agent in agents),
-        tool_calls=_as_int(totals.get("tool_calls")) or sum(agent.tool_calls for agent in agents),
+        agent_count=len(raw_agents),
+        tokens=_as_int(totals.get("tokens")) or sum(_as_int(agent.get("tokens")) for agent in raw_agents),
+        tool_calls=_as_int(totals.get("tool_calls")) or sum(_as_int(agent.get("tool_calls")) for agent in raw_agents),
         duration_seconds=_duration_seconds(record, snapshot),
         record=record,
     )
@@ -171,18 +352,22 @@ def workflow_view(
 def _agent_view(
     agent: dict[str, Any],
     journal: dict[str, list[str]],
+    outcomes: dict[str, str] | None = None,
 ) -> AgentView:
     agent_id = str(agent.get("id") or "?")
+    full_outcome = (outcomes or {}).get(agent_id)
+    outcome = full_outcome or str(agent.get("result_preview") or agent.get("error") or "Still running...")
     return AgentView(
         id=agent_id,
         label=str(agent.get("label") or f"agent-{agent_id}"),
         status=str(agent.get("status") or "queued"),
         phase=str(agent.get("phase") or "Agents"),
         prompt=str(agent.get("prompt") or agent.get("prompt_preview") or ""),
-        outcome=str(agent.get("result_preview") or agent.get("error") or "Still running..."),
+        outcome=outcome,
         model=str(agent.get("model") or ""),
         tokens=_as_int(agent.get("tokens")),
         tool_calls=_as_int(agent.get("tool_calls")),
+        duration_seconds=_as_duration(agent.get("duration_seconds")),
         transcript_path=str(agent.get("transcript_path") or ""),
         activity=tuple((journal.get(agent_id) or [])[-8:]),
     )
@@ -233,6 +418,29 @@ def _read_journal(raw_path: Any, reader: "_JsonlTailReader") -> dict[str, list[s
             continue
         events.setdefault(agent_id, []).append(text)
     return events
+
+
+def _journal_outcomes(raw_path: Any, reader: "_JsonlTailReader") -> dict[str, str]:
+    """Full agent results from the journal's `result` events (the run record only
+    keeps a 180-char preview; the complete output is journaled)."""
+    outcomes: dict[str, str] = {}
+    for value in reader.read(raw_path):
+        if str(value.get("type") or "") != "result":
+            continue
+        agent_id = str(value.get("agentId") or "")
+        if not agent_id or value.get("result") is None:
+            continue
+        outcomes[agent_id] = _result_text(value.get("result"))
+    return outcomes
+
+
+def _result_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _read_transcript_activity(raw_path: Any, reader: "_JsonlTailReader") -> list[str]:
@@ -344,3 +552,12 @@ def _as_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _as_duration(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None

@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -13,7 +14,12 @@ from unittest.mock import patch
 
 from hermes_dynamic_workflows.storage.store import WorkflowStore
 from hermes_dynamic_workflows.tui.app import TuiController
-from hermes_dynamic_workflows.tui.model import PhaseView, WorkflowRepository, _JsonlTailReader
+from hermes_dynamic_workflows.tui.model import (
+    PhaseView,
+    WorkflowRepository,
+    _JsonlTailReader,
+    group_sessions,
+)
 from hermes_dynamic_workflows.tui.render import RenderState, _display_width, render_screen
 
 
@@ -35,8 +41,7 @@ class TuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = _fake_store(Path(tmp))
             repository = WorkflowRepository(store)
-            workflows = repository.load()
-            running = next(workflow for workflow in workflows if workflow.status == "running")
+            running = repository.detail("wf_fake-running")
             hydrated = repository.hydrate_agent_activity(running, phase_index=0, agent_index=0)
 
         self.assertEqual(running.name, "dynamic-workflow-research")
@@ -61,45 +66,35 @@ class TuiTests(unittest.TestCase):
                     + "\n"
                 )
             store.save_run(record)
-            running = next(
-                workflow
-                for workflow in WorkflowRepository(store).load()
-                if workflow.status == "running"
-            )
+            running = WorkflowRepository(store).detail("wf_fake-running")
 
         self.assertIn('terminal({"command":"pwd"})', running.agents[1].activity)
 
     def test_renders_claude_style_list_workflow_and_agent_views(self):
         with tempfile.TemporaryDirectory() as tmp:
             repository = WorkflowRepository(_fake_store(Path(tmp)))
-            workflows = repository.load()
-            run_index = next(index for index, workflow in enumerate(workflows) if workflow.status == "running")
-            workflows[run_index] = repository.hydrate_agent_activity(
-                workflows[run_index],
-                phase_index=0,
-                agent_index=0,
-            )
-            list_text = "\n".join(render_screen(workflows, RenderState(run_index=run_index), width=120, height=28))
-            workflow_text = "\n".join(
+            summaries = repository.load()  # list view uses lightweight summaries
+            full = repository.detail("wf_fake-running")  # detail views use the full view
+            full = repository.hydrate_agent_activity(full, phase_index=0, agent_index=0)
+            list_text = "\n".join(
                 render_screen(
-                    workflows,
-                    RenderState(view="workflow", run_index=run_index),
+                    summaries,
+                    RenderState(expanded=frozenset({"sess-live"})),
                     width=120,
                     height=28,
                 )
             )
+            workflow_text = "\n".join(
+                render_screen([full], RenderState(view="workflow"), width=120, height=28)
+            )
             agent_text = "\n".join(
-                render_screen(
-                    workflows,
-                    RenderState(view="agent", run_index=run_index),
-                    width=120,
-                    height=32,
-                )
+                render_screen([full], RenderState(view="agent"), width=120, height=32)
             )
 
         self.assertIn("Dynamic workflows", list_text)
-        self.assertIn("1 running · 1 completed", list_text)
-        self.assertIn("dynamic-workflow-research", list_text)
+        self.assertIn("2 sessions · 1 running", list_text)
+        self.assertIn("live-project", list_text)  # session group header (cwd basename)
+        self.assertIn("dynamic-workflow-research", list_text)  # workflow row in expanded group
         self.assertIn("Phases", workflow_text)
         self.assertIn("Search · 2 agents", workflow_text)
         self.assertIn("search:claude-articles", workflow_text)
@@ -108,22 +103,152 @@ class TuiTests(unittest.TestCase):
         self.assertIn("WebSearch", agent_text)
         self.assertIn("Still running...", agent_text)
 
+    def test_agent_row_and_detail_show_duration_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = WorkflowRepository(_fake_store(Path(tmp))).detail("wf_fake-completed")
+        timed = replace(base.agents[0], duration_seconds=76.0)
+        wf = replace(base, agents=(timed,), phases=(PhaseView(title="Search", agents=(timed,)),))
+        workflow_text = "\n".join(render_screen([wf], RenderState(view="workflow"), width=110, height=24))
+        agent_text = "\n".join(render_screen([wf], RenderState(view="agent"), width=110, height=24))
+        self.assertIn("· 1m 16s", workflow_text)
+        self.assertIn("· 1m 16s", agent_text)
+
+    def test_agent_detail_scrolls_with_indicator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = WorkflowRepository(_fake_store(Path(tmp))).detail("wf_fake-completed")
+        agent = replace(base.agents[0], outcome="\n".join(f"line {i}" for i in range(60)))
+        wf = replace(base, agents=(agent,), phases=(PhaseView(title="Search", agents=(agent,)),))
+        top = "\n".join(render_screen([wf], RenderState(view="agent"), width=100, height=20))
+        self.assertRegex(top, r"1-\d+ of \d+ ↓")
+        self.assertIn("line 0", top)
+        bottom = "\n".join(render_screen([wf], RenderState(view="agent", detail_scroll=999), width=100, height=20))
+        self.assertRegex(bottom, r"of \d+ ↑")
+        self.assertIn("line 59", bottom)
+        self.assertNotIn("line 0", bottom)
+
+    def test_repository_caches_terminal_runs_between_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            calls: list[str] = []
+            original = store.load_run
+            store.load_run = lambda run_id: (calls.append(run_id), original(run_id))[1]
+            repository = WorkflowRepository(store)
+            repository.load()
+            repository.load()
+            # Terminal runs are parsed once and then served from cache; active runs
+            # are re-parsed each load so their live duration keeps ticking.
+            self.assertEqual(calls.count("wf_fake-completed"), 1)
+            self.assertEqual(calls.count("wf_fake-running"), 2)
+            record = original("wf_fake-completed")
+            assert record is not None
+            calls.clear()
+            store.save_run(record)
+            repository.load()
+            self.assertIn("wf_fake-completed", calls)
+
+    def test_load_returns_summaries_and_detail_builds_full(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = WorkflowRepository(_fake_store(Path(tmp)))
+            summaries = repo.load()
+            live = next(workflow for workflow in summaries if workflow.run_id == "wf_fake-running")
+            # summary: no per-agent detail or phases built...
+            self.assertEqual(live.agents, ())
+            self.assertEqual(live.phases, ())
+            # ...but the counts the list needs are still present
+            self.assertEqual(live.agent_count, 2)
+            self.assertGreater(live.tokens, 0)
+            # detail() builds the full view on demand
+            full = repo.detail("wf_fake-running")
+            self.assertEqual(len(full.agents), 2)
+            self.assertEqual([phase.title for phase in full.phases], ["Search", "Summarize"])
+            self.assertEqual(full.agent_count, 2)
+
+    def test_world_version_changes_when_a_run_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            repo = WorkflowRepository(store)
+            before = repo.world_version()
+            time.sleep(0.01)
+            record = store.load_run("wf_fake-running")
+            assert record is not None
+            store.save_run(record)  # tmp+rename bumps the runs-dir mtime
+            self.assertNotEqual(repo.world_version(), before)
+
+    def test_right_arrow_on_run_opens_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = TuiController(WorkflowRepository(_fake_store(Path(tmp))))
+            controller.refresh()
+            controller.handle_key("down")            # session header -> run row
+            self.assertEqual(controller._cursor_item()[0], "run")
+            controller.handle_key("right")           # → drills into the workflow
+            self.assertEqual(controller.state.view, "workflow")
+
+    def test_workflow_phase_arrows_move_even_with_summary_current_run(self):
+        # Regression: phase count must come from the detail view, not the summary.
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = TuiController(WorkflowRepository(_fake_store(Path(tmp))))
+            controller.refresh()
+            controller.handle_key("down")
+            controller.handle_key("enter")           # open workflow, focus = phases
+            self.assertEqual(controller.state.phase_index, 0)
+            controller.handle_key("down")            # move down the Phases pane
+            self.assertEqual(controller.state.phase_index, 1)
+
+    def test_agent_outcome_uses_full_journal_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            record = store.load_run("wf_fake-running")
+            assert record is not None
+            full_result = "FULL OUTCOME LINE\n" * 50
+            with Path(record["journalFile"]).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "result", "agentId": "1", "result": full_result}) + "\n")
+            store.save_run(record)
+            view = WorkflowRepository(store).detail("wf_fake-running")
+        agent = next(item for item in view.agents if item.id == "1")
+        self.assertEqual(agent.outcome, full_result)  # full journal result, not the 180-char preview
+
+    def test_controller_scroll_keys_and_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = TuiController(WorkflowRepository(_fake_store(Path(tmp))))
+            controller.refresh()
+            controller.handle_key("down")   # session header -> its workflow row
+            controller.handle_key("enter")  # open workflow (focus: phases)
+            controller.handle_key("right")  # focus the agents pane
+            controller.handle_key("enter")  # open agent
+            self.assertEqual(controller.state.view, "agent")
+            controller.handle_key("j")
+            controller.handle_key("j")
+            self.assertEqual(controller.state.detail_scroll, 2)
+            # The selected agent's detail fits this viewport, so frame() clamps to 0.
+            controller.frame(120, 40)
+            self.assertEqual(controller.state.detail_scroll, 0)
+            controller.handle_key("j")
+            self.assertEqual(controller.state.detail_scroll, 1)
+            controller.handle_key("down")
+            self.assertEqual(controller.state.detail_scroll, 0)
+
     def test_controller_navigation_save_and_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = _fake_store(Path(tmp))
             controller = TuiController(WorkflowRepository(store))
             controller.refresh()
-            running_index = next(index for index, workflow in enumerate(controller.workflows) if workflow.status == "running")
-            controller.state = replace(controller.state, run_index=running_index)
 
+            controller.handle_key("down")   # session header -> its workflow row
             controller.handle_key("enter")
             self.assertEqual(controller.state.view, "workflow")
-            controller.handle_key("enter")
+            self.assertEqual(controller.state.focus, "phases")
+            controller.handle_key("right")   # step into the agents pane (no drill yet)
+            self.assertEqual(controller.state.view, "workflow")
+            self.assertEqual(controller.state.focus, "agents")
+            controller.handle_key("right")   # now drill into the agent
             self.assertEqual(controller.state.view, "agent")
             controller.handle_key("down")
             self.assertEqual(controller.state.agent_index, 1)
             controller.handle_key("esc")
             self.assertEqual(controller.state.view, "workflow")
+            self.assertEqual(controller.state.focus, "agents")
+            controller.handle_key("left")    # back to the phases pane
+            self.assertEqual(controller.state.focus, "phases")
             controller.handle_key("s")
             self.assertIn("Saved to", controller.state.message)
             self.assertTrue((store.exports_dir / f"{controller.current_run.run_id}.md").is_file())
@@ -161,15 +286,15 @@ class TuiTests(unittest.TestCase):
 
     def test_rendered_views_keep_selected_items_and_footer_visible(self):
         with tempfile.TemporaryDirectory() as tmp:
-            workflows = WorkflowRepository(_fake_store(Path(tmp))).load()
-        base = workflows[0]
+            base = WorkflowRepository(_fake_store(Path(tmp))).detail("wf_fake-running")
         many_workflows = [
             replace(base, run_id=f"wf-{index}", name=f"run-{index}", description=f"run-{index}")
             for index in range(30)
         ]
+        # all 30 share base's session; expand it and put the cursor on run-29 (item 30)
         list_lines = render_screen(
             many_workflows,
-            RenderState(run_index=29),
+            RenderState(expanded=frozenset({base.session_id}), list_cursor=30),
             width=100,
             height=12,
         )
@@ -204,7 +329,7 @@ class TuiTests(unittest.TestCase):
 
         self.assertIn("run-29", "\n".join(list_lines))
         self.assertNotIn("run-0", "\n".join(list_lines))
-        self.assertIn("q close", list_lines[-1])
+        self.assertIn("Esc to close", list_lines[-1])
         self.assertIn("phase-19", "\n".join(workflow_lines))
         self.assertNotIn("phase-0 ", "\n".join(workflow_lines))
         self.assertIn("agent-19", "\n".join(agent_lines))
@@ -272,13 +397,50 @@ class TuiTests(unittest.TestCase):
                 "hermes_dynamic_workflows.tui.model._read_transcript_activity",
                 return_value=["Read(file.py)"],
             ) as read_activity:
-                workflows = repository.load()
+                repository.load()
                 read_activity.assert_not_called()
-                running = next(workflow for workflow in workflows if workflow.status == "running")
+                running = repository.detail("wf_fake-running")
                 hydrated = repository.hydrate_agent_activity(running, phase_index=0, agent_index=0)
 
         read_activity.assert_called_once()
         self.assertEqual(hydrated.agents[0].activity, ("Read(file.py)",))
+
+    def test_group_sessions_buckets_drops_session_less_and_marks_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workflows = WorkflowRepository(_fake_store(Path(tmp))).load()
+        groups = group_sessions(workflows)
+        self.assertEqual({group.key for group in groups}, {"sess-live", "sess-done"})
+        # the session with a running run sorts first and is flagged current
+        self.assertEqual(groups[0].key, "sess-live")
+        self.assertTrue(groups[0].is_current)
+        self.assertFalse(groups[1].is_current)
+        self.assertEqual(groups[0].project, "live-project")
+        self.assertEqual(groups[0].running, 1)
+        # a run without a session id is dropped from the grouped view
+        live = next(workflow for workflow in workflows if workflow.session_id == "sess-live")
+        orphan = replace(live, record={**live.record, "workflowSessionId": ""})
+        self.assertEqual(len(group_sessions(workflows + [orphan])), 2)
+
+    def test_controller_accordion_expand_collapse_and_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = TuiController(WorkflowRepository(_fake_store(Path(tmp))))
+            controller.refresh()
+            # current (running) session expanded by default, cursor on its header
+            self.assertIn("sess-live", controller.state.expanded)
+            self.assertEqual(controller._cursor_item()[0], "group")
+            controller.handle_key("left")   # collapse current
+            self.assertNotIn("sess-live", controller.state.expanded)
+            controller.handle_key("right")  # expand again
+            self.assertIn("sess-live", controller.state.expanded)
+            controller.handle_key("down")   # onto the workflow row
+            self.assertEqual(controller._cursor_item()[0], "run")
+            controller.handle_key("enter")  # open it
+            self.assertEqual(controller.state.view, "workflow")
+            self.assertEqual(controller.current_run.session_id, "sess-live")
+            controller.handle_key("esc")    # back to the list, cursor still on the run
+            controller.handle_key("left")   # collapse from a run -> cursor jumps to header
+            self.assertNotIn("sess-live", controller.state.expanded)
+            self.assertEqual(controller._cursor_item()[0], "group")
 
     def test_controller_sends_stop_pause_resume_and_restart_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -286,8 +448,7 @@ class TuiTests(unittest.TestCase):
             store = _fake_store(Path(tmp))
             controller = TuiController(WorkflowRepository(store, control_client=control))
             controller.refresh()
-            running_index = next(index for index, item in enumerate(controller.workflows) if item.status == "running")
-            controller.state = replace(controller.state, run_index=running_index)
+            controller.handle_key("down")   # select the running workflow inside its session
 
             controller.handle_key("p")
             controller.handle_key("x")
@@ -298,9 +459,7 @@ class TuiTests(unittest.TestCase):
             record["status"] = "paused"
             store.save_run(record)
             controller.refresh()
-            paused_index = next(index for index, item in enumerate(controller.workflows) if item.run_id == "wf_fake-running")
-            controller.state = replace(controller.state, run_index=paused_index)
-            controller.handle_key("p")
+            controller.handle_key("p")   # cursor still on the (now paused) run -> resume
 
         self.assertEqual([request["action"] for request in control.requests], ["pause", "stop", "restart", "resume"])
         self.assertEqual(control.requests[0]["owner"], "fake-control-owner")
@@ -366,6 +525,8 @@ def _fake_store(root: Path) -> WorkflowStore:
     running = {
         "runId": "wf_fake-running",
         "taskId": "wgfake01",
+        "workflowSessionId": "sess-live",
+        "cwd": "/work/live-project",
         "controlOwner": "fake-control-owner",
         "status": "running",
         "createdAt": (datetime.now(timezone.utc) - timedelta(seconds=36)).isoformat(),
@@ -418,6 +579,8 @@ def _fake_store(root: Path) -> WorkflowStore:
     completed = {
         "runId": "wf_fake-completed",
         "taskId": "wgfake02",
+        "workflowSessionId": "sess-done",
+        "cwd": "/work/done-project",
         "controlOwner": "fake-control-owner",
         "status": "completed",
         "createdAt": "2026-06-05T00:00:00+00:00",
