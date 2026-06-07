@@ -1,68 +1,71 @@
 # Hermes Dynamic Workflows
 
-你现在可以在 Hermes 里用 **Dynamic Workflows** 了：让模型现写一段受限 Python 脚本，
-后台运行时执行它、用 `agent()/parallel()/pipeline()` 编排大量独立子代理——适合代码库
-审计、大规模迁移、交叉验证的研究。参考自 [Dynamic Workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code)。
+English | [简体中文](./README.zh-CN.md)
 
-## 快速开始
+You can now use **Dynamic Workflows** in Hermes: have the model write a sandboxed Python
+script on the fly, execute it in the background runtime, and orchestrate large numbers
+of independent subagents with `agent()/parallel()/pipeline()` — ideal for codebase
+audits, large-scale migrations, and cross-validated research. Inspired by
+[Dynamic Workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code).
 
-一行装好并启用：
+## Quick Start
 
-```bash
-hermes plugins install lingjiuu/hermes-dynamic-workflows --enable && hermes tools enable workflow --platform cli
-```
-
-> gateway 平台把 `--platform cli` 换成 `telegram` 等，再 `hermes gateway restart`。
-
-装完直接对 Hermes 说「用 workflow 跑一个 …」即可。
-
-### 实时面板（可选，需单独一步）
-
-`hermes plugins install` 只克隆插件、不安装它的 console 脚本，所以面板命令要单独装一次：
+Install and enable in one line:
 
 ```bash
-python "${HERMES_HOME:-$HOME/.hermes}/plugins/dynamic-workflows/scripts/install-hermes-workflows.py"
-# 装到 ~/.local/bin
+hermes plugins install lingjiuu/hermes-dynamic-workflows --enable
 ```
 
-之后在**另一个终端**运行 `hermes-workflows`，实时查看 run 列表、各 phase/agent 进度、
-每个子代理的 prompt 与产出，并用 `x` 停止、`p` 暂停/恢复、`r` 重启、`s` 导出 transcript。
+> Gateway users: run `hermes gateway restart` after installing.
 
-> 完整 JSON Schema 校验需要 `jsonschema`（装进运行 Hermes 的同一 Python 环境；缺失时
-> 用内置简易校验器）：
-> `uv pip install --python "$(head -n 1 "$(command -v hermes)" | sed 's/^#!//')" "jsonschema>=4,<5"`。
+Once it's installed, just tell Hermes "run a workflow that …" and you're set.
 
-## 配置（可选）
+### Live Dashboard (optional, requires a separate step)
 
-插件从 Hermes 的 `~/.hermes/config.yaml` 读下面这一节（每个键也支持
-`HERMES_DYNAMIC_WORKFLOWS_*` 环境变量覆盖）：
+`hermes plugins install` only clones the plugin — it does not install its console
+scripts, so the dashboard command has to be installed once separately:
+
+```bash
+python3 "${HERMES_HOME:-$HOME/.hermes}/plugins/dynamic-workflows/scripts/install-hermes-workflows.py"
+# Installs to ~/.local/bin
+```
+
+Then, in **a separate terminal**, run `hermes-workflows` to open the interactive
+dashboard, where you can watch the run list, per-phase/per-agent progress, and each
+subagent's prompt and output in real time.
+
+## Configuration (optional)
+
+The plugin reads the following section from Hermes's `~/.hermes/config.yaml` (every key
+can also be overridden via a `HERMES_DYNAMIC_WORKFLOWS_*` environment variable):
 
 ```yaml
 plugins:
   entries:
     dynamic-workflows:
       dynamic_workflows:
-        concurrency: 8                # 最大并发 agent 数（默认 min(16, cpu-2)）
-        max_concurrency: 16           # 并发上限硬限制
-        max_agents: 1000              # 单个 run 的 agent 总数上限（防逃逸）
-        workflow_timeout_seconds: 900 # 整个 run 的 wall-clock 超时（不含暂停时间）
-        child_timeout_seconds: 300    # 单个子 agent 超时
+        concurrency: 8                # Max concurrent agents (default: min(16, cpu-2))
+        max_concurrency: 16           # Hard cap on concurrency
+        max_agents: 1000              # Max total agents per run (runaway guard)
+        workflow_timeout_seconds: 900 # Wall-clock timeout for the whole run (excludes paused time)
+        child_timeout_seconds: 300    # Timeout for a single child agent
         blocked_child_toolsets: [workflow, delegation, code_execution, memory, messaging, clarify]
-                                      # 子 agent 禁止使用的 toolsets
+                                      # Toolsets child agents are forbidden to use
         default_child_toolsets: [web, file, terminal, skills]
-                                      # 子 agent 默认 toolset（不指定 agentType 时生效）
-        keep_worktrees: false         # 是否保留 agent 的 git worktree（默认自动清理）
-        allow_model_override: true    # 是否允许 agent(model=...) 指定模型
-        require_launch_approval: true # 顶层 workflow 启动前需确认（无人在线则拒绝）
-        child_approval_policy: inherit # 子 agent 审批策略: inherit|smart|deny|approve|ask
-        ask_fallback: smart           # ask 无人可达时的降级: smart|deny|approve
-        notify_on_complete: true      # 完成时通知发起 CLI 或 gateway 会话
-        notify_result_preview_chars: 2000  # 通知中结果预览的截断字符数
+                                      # Default toolsets for child agents (used when no agentType is given)
+        keep_worktrees: false         # Whether to keep each agent's git worktree (auto-cleaned by default)
+        allow_model_override: true    # Whether agent(model=...) may override the model
+        require_launch_approval: true # Require confirmation before a top-level workflow launches (denied if nobody is online)
+        child_approval_policy: inherit # Child agent approval policy: inherit|smart|deny|approve|ask
+        ask_fallback: smart           # Fallback when "ask" has no one to reach: smart|deny|approve
+        notify_on_complete: true      # Notify the originating CLI or gateway session on completion
+        notify_result_preview_chars: 2000  # Truncation length (chars) for the result preview in notifications
 ```
 
-## 能力一瞥
+## Script API
 
-工作流脚本就是一段 async Python，首句是字面量 `meta`，之后用受限全局编排子代理：
+A workflow script is just a piece of async Python whose first statement is a literal
+`meta`; after that you orchestrate child agents using the sandboxed globals:
 
 ```python
 meta = {
@@ -71,7 +74,8 @@ meta = {
     "phases": [{"title": "Review"}, {"title": "Verify"}],
 }
 
-# 每个目标独立流过 review → verify（pipeline 无栅栏：A 可在 verify 时 B 还在 review）
+# Each target flows through review → verify independently
+# (pipeline has no barrier: A can be at verify while B is still at review)
 findings = await pipeline(
     args["targets"],
     lambda t, _o, i: agent(f"Review for bugs: {t}", {"label": f"review:{i}", "phase": "Review"}),
@@ -80,33 +84,57 @@ findings = await pipeline(
 return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 ```
 
-- `agent(prompt, opts)` 起一个子代理；`opts` 可带 `schema`（强制结构化输出）、`model`、
-  `agentType`、`isolation="worktree"`。
-- `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`phase`/`log` 报告进度；
-  `workflow()` 内联跑命名工作流；`args` / `budget` 取入参与 token 预算。
+- `agent(prompt, opts)` spawns a child agent; `opts` may include `schema` (enforce
+  structured output), `model`, `agentType`, and `isolation="worktree"`.
+- `pipeline` (default, no barrier) / `parallel` (with barrier) handle concurrency;
+  `phase`/`log` report progress; `workflow()` runs a named workflow inline; `args` /
+  `budget` access the input arguments and the token budget.
 
 ### Agent Type
 
-脚本里通过 `agentType` 指定子代理类型，不填则默认 `general-purpose`（全工具集）:
+Specify a child agent's type via `agentType` in the script; if omitted, it defaults to
+`general-purpose` (full toolset):
 
-| 类型 | 工具集 | 说明 |
-|------|--------|------|
-| `general-purpose` | `*`（全部安全工具） | 默认，适合搜索代码、研究复杂问题、多步任务 |
-| `explore` | 只读（read_file, search_files, terminal） | 快速代码库探索，适合找文件、搜关键词 |
-| `plan` | 只读（read_file, search_files, terminal） | 软件架构设计，输出分步实现方案 |
-| `verification` | web + file + terminal + browser | 验证实现正确性，跑构建/测试/lint 出 PASS/FAIL |
+| Type | Toolset | Description |
+|------|---------|-------------|
+| `general-purpose` | `*` (all safe tools) | Default; good for searching code, researching complex problems, and multi-step tasks |
+| `explore` | Read-only (read_file, search_files, terminal) | Fast codebase exploration; good for locating files and searching keywords |
+| `plan` | Read-only (read_file, search_files, terminal) | Software architecture design; outputs a step-by-step implementation plan |
+| `verification` | web + file + terminal + browser | Verifies implementation correctness; runs build/test/lint to emit PASS/FAIL |
 
-Agent type 定义在 `<插件目录>/hermes_dynamic_workflows/agents/*.md` 里。
-要加自定义类型，在 `~/.hermes/dynamic-workflows/agents/` 下放同名 `.md` 即可覆盖内置定义，
-格式参考内置的 `general-purpose.md`。
+Agent types are resolved from three locations in priority order (on a name collision,
+earlier locations override later ones):
 
-运行时持久化脚本与每个子代理的完整执行链路（transcript），并在完成时把
-`<task-notification>` 注入对话——无需轮询。用 `/workflows` 看历史与详情。
+1. `<project>/.hermes/dynamic-workflows/agents/*.md`  — project level, applies only to the current project
+2. `~/.hermes/dynamic-workflows/agents/*.md`          — user level, applies globally
+3. `<plugin>/hermes_dynamic_workflows/agents/*.md`    — built-in defaults (general-purpose/explore/plan/verification)
 
-## 深入
+To add a custom type, create a new `.md` file under directory 1 or 2 in the following format:
 
-实现细节（核心链路、工具与完整调用结果、prompt cache、并发与限额、权限治理、从
-state.db 重建 transcript、沙箱、resume…）见 [TECHNICAL.md](./TECHNICAL.md)。
+```markdown
+---
+name: my-agent
+description: "A short description of what this agent is for; the model uses it to automatically pick the right agent."
+model: inherit
+toolsets: [web, file, terminal]
+---
+
+Write the agent's system prompt here to guide its behavior, style, and constraints.
+```
+
+`name` and `description` are required; `model` defaults to `inherit` (inherits the
+current session's model); `toolsets` defaults to the global `default_child_toolsets`;
+optional fields also include `allowed_tools`, `disallowed_tools`, and `isolation`.
+
+At runtime the plugin persists the script and the full execution trace (transcript) of
+every child agent, and injects a `<task-notification>` into the conversation on
+completion — no polling required. Use `/workflows` to view history and details.
+
+## Deep Dive
+
+For implementation details (core execution path, tools and full call results, prompt
+cache, concurrency and limits, permission governance, rebuilding transcripts from
+`state.db`, sandboxing, resume…), see [TECHNICAL.md](./TECHNICAL.md).
 
 ## License
 

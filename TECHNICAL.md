@@ -1,63 +1,74 @@
-# Hermes Dynamic Workflows — 技术文档
+# Hermes Dynamic Workflows — Technical Documentation
 
-模型现写一段受限 Python 脚本，后台运行时执行它，用 `agent()/parallel()/pipeline()`
-编排大量独立 Hermes 子代理。本文逐点说明实现；所有结果字符串取自源码。
+The model writes a sandboxed Python script on the fly, the background runtime executes
+it, and it orchestrates large numbers of independent Hermes subagents with
+`agent()/parallel()/pipeline()`. This document explains the implementation point by
+point; all result strings are taken verbatim from the source.
 
-## 核心链路
+## Core Execution Path
 
-主代理调 `workflow` 工具 → `WorkflowRunManager.start_from_params`：
+The main agent calls the `workflow` tool → `WorkflowRunManager.start_from_params`:
 
-1. 解析来源（`script` / `scriptPath` / `name` 三选一）。
-2. `parse_script` + `extract_meta`：AST 校验，取首句字面量 `meta`。
-3. 顶层启动审批（`require_launch_approval`，默认开）。
-4. 持久化脚本、建 run 记录、起后台守护线程，**工具同步返回** Task ID / Run ID / 脚本路径。
+1. Resolve the source (one of `script` / `scriptPath` / `name`).
+2. `parse_script` + `extract_meta`: AST validation, extracting the first-statement literal `meta`.
+3. Top-level launch approval (`require_launch_approval`, on by default).
+4. Persist the script, create the run record, start a background daemon thread, and **the tool returns synchronously** with the Task ID / Run ID / script path.
 
-后台线程 `run_workflow`：把 `meta` 之后的脚本体包成私有 async 入口，注入受限全局，
-`exec` 执行。脚本里的 `await agent(...)` → `WorkflowAPI` → 并发槽 →
-`HermesChildAgentRunner` 起一个独立 `AIAgent` 子代理，返回其文本（或 schema 校验后的对象）。
+Background thread `run_workflow`: wraps the script body after `meta` into a private
+async entry point, injects the sandboxed globals, and runs it with `exec`. An
+`await agent(...)` in the script → `WorkflowAPI` → a concurrency slot →
+`HermesChildAgentRunner` spawns an independent `AIAgent` subagent and returns its text
+(or the schema-validated object).
 
-每次状态变化：快照写 run 记录 + `journal.jsonl`，子代理 transcript 实时导出。
-终态：写 output 文件、最终 flush transcript、向主对话注入 `<task-notification>`（仅 CLI）。
+On every state change: a snapshot is written to the run record + `journal.jsonl`, and
+subagent transcripts are exported in real time. On terminal state: write the output
+file, do a final transcript flush, and inject a `<task-notification>` into the main
+conversation (CLI only).
 
-落盘位置（`<cwd>` 为清洗后的工作目录）：
+On-disk locations (`<cwd>` is the sanitized working directory):
 
 ```
-~/.hermes/projects/<cwd>/<sessionId>/workflows/scripts/<name>-<runId>.py   # 持久脚本
-~/.hermes/projects/<cwd>/<sessionId>/subagents/workflows/<runId>/          # transcript 目录
-    journal.jsonl                                                         # 运行事件流
-    agent-<sessionId>.jsonl  +  .meta.json                                # 每个子代理
+~/.hermes/projects/<cwd>/<sessionId>/workflows/scripts/<name>-<runId>.py   # persisted script
+~/.hermes/projects/<cwd>/<sessionId>/subagents/workflows/<runId>/          # transcript directory
+    journal.jsonl                                                         # run event stream
+    agent-<sessionId>.jsonl  +  .meta.json                                # one per subagent
 ```
 
 ## Python Script API
 
-脚本体本身即 async：直接写顶层 `await` / `return`，**首句必须是纯字面量
-`meta = {...}`**（必填 `name`、`description`；可选 `whenToUse`、`phases`）。
+The script body is itself async: write top-level `await` / `return` directly. **The
+first statement must be a pure literal `meta = {...}`** (`name` and `description`
+required; `whenToUse` and `phases` optional).
 
-| 全局 | 签名 | 说明 |
+| Global | Signature | Description |
 |---|---|---|
-| `agent` | `await agent(prompt, opts=None)` | 起一个子代理。无 schema 返回文本；带 `schema` 返回校验后的对象。`opts`：`label` `phase` `schema` `model` `isolation` `agentType`。被用户跳过返回 `None`。 |
-| `pipeline` | `await pipeline(items, stage1, …)` | 每个 item 独立流过各阶段，**无栅栏**。stage 回调收 `(prev, original, index)`；stage 抛错 → 该 item 变 `None`。多阶段默认用它。 |
-| `parallel` | `await parallel(thunks)` | 并发执行，**栅栏**：全部完成才返回。单个失败 → 结果里为 `None`（整体不抛）。 |
-| `phase` | `phase(title)` | 开启进度分组。 |
-| `log` | `log(message)` | 向用户发一行进度。 |
-| `workflow` | `await workflow(name_or_ref, args=None)` | 内联跑另一个工作流，共享并发/计数/停止/预算；仅一层嵌套。 |
-| `args` | — | 工具入参 `args` 原样；未传为 `None`。 |
-| `budget` | `budget.total` / `spent()` / `remaining()` | 取自用户消息里的 `+500k` 类目标。`total` 是硬上限，达到后 `agent()` 抛错；未设时 `remaining()` 为 `math.inf`。 |
+| `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. `opts`: `label` `phase` `schema` `model` `isolation` `agentType`. Returns `None` if skipped by the user. |
+| `pipeline` | `await pipeline(items, stage1, …)` | Each item flows through the stages independently, **no barrier**. Stage callbacks receive `(prev, original, index)`; if a stage throws → that item becomes `None`. The default for multi-stage work. |
+| `parallel` | `await parallel(thunks)` | Runs concurrently, **with a barrier**: returns only once all complete. A single failure → `None` in the results (the whole call does not throw). |
+| `phase` | `phase(title)` | Starts a progress group. |
+| `log` | `log(message)` | Sends a line of progress to the user. |
+| `workflow` | `await workflow(name_or_ref, args=None)` | Runs another workflow inline, sharing concurrency/counts/stop/budget; one level of nesting only. |
+| `args` | — | The tool input `args` verbatim; `None` if not passed. |
+| `budget` | `budget.total` / `spent()` / `remaining()` | Taken from a `+500k`-style target in the user's message. `total` is a hard cap — once reached, `agent()` throws; when unset, `remaining()` is `math.inf`. |
 
-其余可用：`json`、`math`、安全内建、常见异常类型。**禁止**（沙箱拒绝）：import、
-文件/进程/网络、dunder 穿透、`eval/exec`、class 定义、动态调用目标、时间/随机 API
-（破坏 resume）。
+Also available: `json`, `math`, safe builtins, and common exception types. **Forbidden**
+(rejected by the sandbox): imports, file/process/network access, dunder traversal,
+`eval/exec`, class definitions, dynamic call targets, and time/randomness APIs (they
+break resume).
 
-## 工具
+## Tools
 
-插件向 Hermes 注册两个主代理工具（`workflow`、`task_stop`）和一个子代理专用工具
-（`structured_output`，仅在带 schema 的子代理存活期间临时注册）。
+The plugin registers two main-agent tools with Hermes (`workflow`, `task_stop`) and one
+subagent-only tool (`structured_output`, registered temporarily only while a
+schema-bearing subagent is alive).
 
 ### workflow
 
-后台执行一段编排脚本；同步返回，完成时注入 `<task-notification>`。
+Executes an orchestration script in the background; returns synchronously and injects a
+`<task-notification>` on completion.
 
-工具 schema（描述极长，此处以 `…` 略去；参数完整如下）：
+Tool schema (the description is very long and elided here with `…`; the parameters are
+shown in full below):
 
 ```json
 {
@@ -79,12 +90,14 @@
 }
 ```
 
-启动时还会把当前可用的 agentType 列表追加到描述末尾。
+At launch, the list of currently available agentTypes is also appended to the end of the
+description.
 
-**工具调用结果。** 启动是同步的——下列结果在后台线程开始前返回，此时**没有**
-notification（run 尚未开始）。
+**Tool call results.** Launch is synchronous — the results below are returned before the
+background thread starts, at which point there is **no** notification yet (the run has
+not begun).
 
-成功启动：
+On successful launch:
 
 ```
 Workflow launched in background. Workflow Task ID: <taskId>
@@ -96,13 +109,14 @@ To resume after editing the script: Workflow({scriptPath: "<path>", resumeFromRu
 You will be notified when it completes. Use /workflows to watch live progress.
 ```
 
-校验/解析/输入类错误统一包成 `{"error":"<msg>"}`（`<msg>` 为下列之一）：
+Validation/parse/input errors are uniformly wrapped as `{"error":"<msg>"}` (where
+`<msg>` is one of the following):
 
 ```
-# 来源缺失
+# missing source
 provide one of script, scriptPath, or name
 
-# meta 契约（首句必须是纯字面量 meta 字典）
+# meta contract (the first statement must be a pure literal meta dict)
 Invalid workflow script: `meta = {...}` must be the FIRST statement in the script
 Invalid workflow script: meta must be a pure literal
 Invalid workflow script: meta must be a pure literal: only plain properties allowed in meta
@@ -118,12 +132,12 @@ Invalid workflow script: meta.phases object entries require a title string
 Invalid workflow script: meta.phases.<detail|model> must be a string
 Invalid workflow script: meta.phases entries must be strings or objects
 
-# 解析 / 体量
+# parsing / size
 Invalid workflow script: Script parse error: <syntax msg> at line <l>, column <c>. Workflow scripts must be plain Python.
 Invalid workflow script: workflow script is too large (<n> chars; max <max>)
 do not define workflow(); the workflow script body is already async
 
-# 沙箱（能力越界）
+# sandbox (capability overreach)
 forbidden Python syntax: <NodeType>
 forbidden name: <name>
 forbidden attribute access: <attr>
@@ -136,43 +150,46 @@ bare 'except:' is not allowed; catch Exception or a specific type
 'except BaseException' is not allowed; catch Exception instead
 Workflow scripts must be deterministic: current time and randomness are unavailable (breaks resume). Stamp results after the workflow returns, or pass timestamps via args.
 
-# resume 目标仍在运行
+# resume target still running
 Workflow <runId> is still running (task <taskId>). Stop it first with task_stop({"task_id":"<taskId>"}) before resuming.
 ```
 
-启动审批未通过同样走 `tool_error`（干净，无 trace）：
+A failed launch approval also goes through `tool_error` (clean, no trace):
 
 ```json
 {"error":"Workflow \"<name>\" was not launched: <reason>. Do not retry; tell the user it needs their approval."}
 ```
 
-`<reason>` 取自审批环节，常见：`workflow launch was denied`、`workflow launch was
-denied or timed out`、`launch approval required but no interactive channel (…)`、
-`launch approval required but Hermes' approval engine is unavailable`。
+`<reason>` comes from the approval step; common values: `workflow launch was denied`,
+`workflow launch was denied or timed out`, `launch approval required but no interactive
+channel (…)`, `launch approval required but Hermes' approval engine is unavailable`.
 
-其它**未预期**异常（真正的内部错误）才返回带 trace 的诊断信息——`trace` 是
-`traceback.format_exc` 的最后 8 行（文件路径、行号、出错代码），随工具结果一并对模型
-可见，便于报告：`{"error":"<Type>: <msg>","trace":"<最后 8 行回溯>"}`。
+Only other **unexpected** exceptions (genuine internal errors) return diagnostics that
+include a trace — `trace` is the last 8 lines of `traceback.format_exc` (file paths,
+line numbers, offending code), visible to the model alongside the tool result to aid
+reporting: `{"error":"<Type>: <msg>","trace":"<last 8 lines of traceback>"}`.
 
-**完成通知。** run 进入终态后（仅 CLI）注入：
+**Completion notification.** Once the run reaches a terminal state (CLI only), this is
+injected:
 
 ```
 <task-notification>
 <task-id><taskId></task-id>
-<output-file><path></output-file>        # 有 output 文件时
+<output-file><path></output-file>        # when an output file exists
 <status><completed|failed|stopped|…></status>
 <summary>Dynamic workflow "<name>" <completed | was stopped | failed: <error> | <status>: <error>></summary>
-<result><结果，超过 notify_result_preview_chars 截断并提示 full result in <file>></result>   # 无 error 时
-<recovery>Agent transcripts: <transcriptDir></recovery>      # 有 error 时
+<result><the result; truncated past notify_result_preview_chars with a "full result in <file>" note></result>   # when there is no error
+<recovery>Agent transcripts: <transcriptDir></recovery>      # when there is an error
 <usage><agent_count>N</agent_count><subagent_tokens>T</subagent_tokens><tool_uses>U</tool_uses><duration_ms>D</duration_ms></usage>
 </task-notification>
 ```
 
 ### task_stop
 
-按 Task ID 停一个后台 run（只作用于存活中的 run；已完成/历史 run 视为找不到）。
+Stops a background run by its Task ID (only affects live runs; completed/historical runs
+are treated as not found).
 
-工具 schema：
+Tool schema:
 
 ```json
 {
@@ -187,168 +204,193 @@ denied or timed out`、`launch approval required but no interactive channel (…
 }
 ```
 
-工具调用结果：
+Tool call results:
 
 ```jsonc
-// 成功（紧凑 JSON）
+// success (compact JSON)
 {"message":"Successfully stopped task: <taskId> (<summary>)","task_id":"<taskId>","task_type":"local_workflow"}
 
-// 缺参数
+// missing parameter
 {"error":"Missing required parameter: task_id"}
 
-// 找不到 / 非存活状态（非 queued|running|paused）
+// not found / not in a live state (not queued|running|paused)
 {"error":"No task found with ID: <taskId>"}
 ```
 
-### structured_output（子代理专用）
+### structured_output (subagent-only)
 
-仅在带 `schema` 的子代理存活期间临时注册；该子代理工具的参数被替换成 `agent(…,
-{"schema"})` 请求的 schema，子代理必须调它来提交最终结果。`agent()` 返回校验后的对象，
-无需解析子代理文本。最多 `MAX_STRUCTURED_OUTPUT_RETRIES = 5` 次尝试。
+Registered temporarily only while a schema-bearing subagent is alive; this tool's
+parameters are replaced with the schema requested in `agent(…, {"schema"})`, and the
+subagent must call it to submit its final result. `agent()` returns the validated object
+— no need to parse the subagent's text. At most `MAX_STRUCTURED_OUTPUT_RETRIES = 5`
+attempts.
 
-子代理若不提交就想结束，会被追加一句继续指令、留在同一会话：
+If a subagent tries to finish without submitting, a continue instruction is appended and
+it is kept in the same session:
 
 ```
 You MUST call the structured_output tool to complete this request. Call this tool now.
 ```
 
-工具调用结果：
+Tool call results:
 
 ```jsonc
-// 成功（纯文本，非 JSON）
+// success (plain text, not JSON)
 Structured output provided successfully
 
-// 校验失败：errors 为各项以 ", " 连接
+// validation failure: errors are the individual items joined by ", "
 {"error":"Output does not match required schema: <errors>"}
-//   单项形如： /path/to/field: must have required property 'x'
+//   each item looks like: /path/to/field: must have required property 'x'
 //             /path: must be <type>      root: must NOT have additional properties
 //             /path: must be equal to one of the allowed values     /path: must match pattern "…"
 
-// 未注册期望（理论上不该出现）
+// no expectation registered (should not occur in theory)
 {"error":"Output does not match required schema: root: no structured-output expectation is registered for this task"}
 
-// 超过最大尝试次数
+// maximum attempts exceeded
 {"error":"Output does not match required schema: root: maximum structured output attempts exceeded (5)"}
 ```
 
-> 校验优先用 `jsonschema`（Draft 2020-12）；未安装时退化为内置简易校验器（覆盖
-> object/array/string/number、required、enum、additionalProperties 等常见关键字）。
+> Validation prefers `jsonschema` (Draft 2020-12); when it's not installed, it falls back
+> to a built-in lightweight validator (covering common keywords like
+> object/array/string/number, required, enum, additionalProperties).
 
 ## Prompt Cache
 
-子代理是独立 `AIAgent`，继承 Hermes 的 prompt caching：对可缓存模型（Claude 系、
-DashScope Qwen…）注入 `cache_control` 断点，每个子代理在自己的多轮工具调用间复用
-`[tools + system]` 前缀。
+Subagents are independent `AIAgent`s and inherit Hermes's prompt caching: for cacheable
+models (the Claude family, DashScope Qwen, …) a `cache_control` breakpoint is injected,
+and each subagent reuses the `[tools + system]` prefix across its own multi-turn tool
+calls.
 
-**跨子代理共享前缀**：Hermes 的 `system_and_3` 策略把断点放在 system 末尾。为此
-**子代理 system 提示在整个 fan-out 中保持逐字节一致**——只含稳定脚手架（基础指令 +
-agentType 指令），而每任务上下文（工作区、label、phase、worktree 提示）放进子代理
-首条 user 消息（`build_child_task_message`）。同 toolset + 同 agentType 的子代理因此
-共享缓存前缀。每子代理的 `cache_read`/`cache_write` 在 `/workflows <runId> agent <id>`
-可见；省幅取决于 provider（非可缓存模型为 0）。
+**Sharing the prefix across subagents**: Hermes's `system_and_3` strategy places the
+breakpoint at the end of the system prompt. To make this work, **the subagent system
+prompt stays byte-for-byte identical across the entire fan-out** — it contains only
+stable scaffolding (base instructions + agentType instructions), while per-task context
+(workspace, label, phase, worktree hints) goes into the subagent's first user message
+(`build_child_task_message`). Subagents with the same toolset + same agentType therefore
+share the cache prefix. The savings depend on the provider (0 for non-cacheable models).
 
-## 并发与限额
+## Concurrency and Limits
 
-- **并发槽**：每 run 一个信号量，上限 `concurrency`（默认 `min(16, cpu-2)`，且 ≤
-  `max_concurrency`=16）。`parallel()/pipeline()` 可投递任意多项，同时只跑约槽数个，
-  其余排队。
-- **agent 上限** `max_agents`（默认 1000）：失控回退闸，远高于任何真实工作流。
-- **循环闸**：每次 `while/for` 迭代注入 `__wf_tick__()`，检查停止 / deadline / 循环
-  上限 `max_loop_iterations`（默认 1e7）。让 deadline 能在纯计算循环里触发。
-- **deadline** `workflow_timeout_seconds`（默认 900s，暂停期间不计）。
-- **子代理超时** `child_timeout_seconds`（默认 300s）：单个超时记 `WorkflowTimeout`
-  抛回脚本（可 `try/except`）。
+- **Concurrency slots**: one semaphore per run, capped at `concurrency` (default
+  `min(16, cpu-2)`, and ≤ `max_concurrency`=16). `parallel()/pipeline()` can submit any
+  number of items, but only about slot-many run at once and the rest queue.
+- **Agent cap** `max_agents` (default 1000): a runaway fallback gate, far above any real
+  workflow.
+- **Loop gate**: each `while/for` iteration injects `__wf_tick__()`, which checks for
+  stop / deadline / the loop cap `max_loop_iterations` (default 1e7). This lets the
+  deadline fire even inside a pure compute loop.
+- **Deadline** `workflow_timeout_seconds` (default 900s, paused time not counted).
+- **Subagent timeout** `child_timeout_seconds` (default 300s): a single timeout raises
+  `WorkflowTimeout` back into the script (catchable with `try/except`).
 
-run 级硬停（用户停止、deadline、预算/agent/循环上限）派生自 `BaseException`，脚本的
-`except Exception` 吞不掉；沙箱并禁止 `except:` / `except BaseException`。
+Run-level hard stops (user stop, deadline, budget/agent/loop caps) derive from
+`BaseException`, so the script's `except Exception` cannot swallow them; the sandbox also
+forbids `except:` / `except BaseException`.
 
-## 权限治理
+## Permission Governance
 
-三道，全部复用 Hermes 自身的审批引擎，不重造：
+Three layers, all reusing Hermes's own approval engine rather than rebuilding one:
 
-1. **启动审批**（`require_launch_approval`，默认开）：顶层 launch 前——CLI 同步确认；
-   gateway 发 approve/deny 按钮并阻塞；无人值守（无通道）则拒绝。嵌套 `workflow()`
-   继承已审批的父 run，不再单独审批。
-2. **子代理命令审批**（`child_approval_policy`）：子代理工具调用照常走 Hermes 审批
-   引擎（危险命令检测、hardline 底线、permanent 白名单、yolo、gateway 异步审批）。
-   本键只决定「被标记的命令本会提示人、但人不在场（后台 run）」时怎么办：`inherit`
-   （跟随 Hermes `approvals.mode`，默认）/ `smart`（辅助 LLM 守卫，推荐无人值守）/
-   `deny` / `approve` / `ask`（有通道问人，否则退化为 `ask_fallback`）。
-3. **pre_tool_call 钩子**：后台子代理跑在脱离会话上下文的线程里，Hermes 自身审批会
-   因缺上下文而误放行或挂起。钩子在 Hermes 的上下文分支前先施加上述策略；放行时还
-   `approve_session()` 该模式，免得下游重新 gating 把命令变成无人可答的 pending。
-   hardline 底线与 permanent 白名单始终生效。
+1. **Launch approval** (`require_launch_approval`, on by default): before a top-level
+   launch — the CLI confirms synchronously; the gateway sends approve/deny buttons and
+   blocks; unattended (no channel) means denial. A nested `workflow()` inherits the
+   already-approved parent run and is not approved separately.
+2. **Subagent command approval** (`child_approval_policy`): subagent tool calls go
+   through the Hermes approval engine as usual (dangerous-command detection, the hardline
+   floor, the permanent allowlist, yolo, gateway async approval). This key only decides
+   what happens when a flagged command would normally prompt a human but no one is
+   present (a background run): `inherit` (follow Hermes `approvals.mode`, default) /
+   `smart` (an assisting LLM guard, recommended for unattended runs) / `deny` / `approve`
+   / `ask` (ask a human if a channel exists, otherwise fall back to `ask_fallback`).
+3. **The pre_tool_call hook**: background subagents run in threads detached from the
+   session context, where Hermes's own approval would, lacking context, either wrongly
+   wave commands through or hang. The hook applies the policy above before Hermes's
+   context branch; when it lets something through it also `approve_session()`s that
+   pattern, so downstream re-gating doesn't turn the command into a pending with no one
+   to answer it. The hardline floor and the permanent allowlist always remain in effect.
 
-## Transcript（从 state.db 重建执行链路）
+## Transcript (Rebuilding the Execution Trace from state.db)
 
-子代理是独立 `AIAgent`，消息落在 Hermes 的 `SessionDB`（SQLite）。为让用户 / 主代理
-看每个子代理的完整执行链路，运行时把这些消息导出成 `agent-<sessionId>.jsonl`
-（+ 同名 `.meta.json` 边车）。
+Subagents are independent `AIAgent`s, and their messages land in Hermes's `SessionDB`
+(SQLite). So that users / the main agent can see each subagent's full execution trace,
+the runtime exports these messages as `agent-<sessionId>.jsonl` (+ a `.meta.json`
+sidecar of the same name).
 
-- **增量读**（`SessionTranscriptReader`）：直接读 `messages` / `sessions` 表。先用
-  递归 CTE 解出**压缩血缘**（一个子代理被上下文压缩后派生新 session，串成一条
-  lineage），再按 `(行数, min/max id, active 计数与 id 和)` 判断是否纯追加——是则只
-  追加新消息，否则整体重建。
-- **全量回退**：schema 不符 / 私有连接不可用 / 增量读异常时，退回公共 API
-  `get_messages(include_inactive=True)`，按内容签名判断是否变化。
-- **实时导出**（`LiveTranscriptExporter`）：每 0.5s 刷新活跃子代理，单 reader + 单
-  writer 串行（避免多 SQLite 连接与原子临时文件竞争）；子代理转终态再 flush 一次；
-  run 结束做一次带校验的最终重建。
+- **Incremental read** (`SessionTranscriptReader`): reads the `messages` / `sessions`
+  tables directly. It first uses a recursive CTE to resolve the **compaction lineage**
+  (when a subagent is context-compacted it spawns a new session, chained into one
+  lineage), then uses `(row count, min/max id, active count and sum of ids)` to decide
+  whether it's append-only — if so it only appends new messages, otherwise it rebuilds
+  wholesale.
+- **Full fallback**: on schema mismatch / unavailable private connection /
+  incremental-read exception, it falls back to the public API
+  `get_messages(include_inactive=True)` and uses a content signature to detect changes.
+- **Live export** (`LiveTranscriptExporter`): refreshes active subagents every 0.5s, with
+  a single reader + single writer running serially (avoiding contention between multiple
+  SQLite connections and the atomic temp file); flushes once more when a subagent reaches
+  a terminal state; and does one final, validated rebuild when the run ends.
 
-`/workflows` 与面板据此展示每个子代理的 prompt、近期工具活动、产出，**不依赖**最终
-output 文件。
+`/workflows` and the dashboard use this to show each subagent's prompt, recent tool
+activity, and output, **without depending** on the final output file.
 
-## 沙箱与确定性
+## Sandbox and Determinism
 
-脚本经 AST 校验后以受限全局 `exec`，门的是**能力**而非**控制流**：`if/for/while/try`
-允许（loop-until-budget / loop-until-dry 需要），但 import、文件/进程/网络、dunder
-穿透、`eval/exec/compile/open/getattr…`、class 定义、动态调用目标一律拒绝；时间/随机
-API 被禁（破坏 resume）。这是护栏，不是完美沙箱——真正隔离需子进程 + RPC（后续步骤）。
+After AST validation the script is `exec`'d with restricted globals; what's gated is
+**capability**, not **control flow**: `if/for/while/try` are allowed (needed for
+loop-until-budget / loop-until-dry), but imports, file/process/network access, dunder
+traversal, `eval/exec/compile/open/getattr…`, class definitions, and dynamic call
+targets are all rejected; time/randomness APIs are forbidden (they break resume). This is
+a guardrail, not a perfect sandbox — true isolation needs subprocesses + RPC (a future
+step).
 
-## Resume / 内容寻址缓存
+## Resume / Content-Addressed Cache
 
-`resumeFromRunId` 复用上一 run 中**未改动**的 `agent()` 结果。指纹按内容寻址
-（prompt + 相关 opts），即便并发调度顺序变了，未变的调用仍命中。改脚本时尽量保留
-靠前的稳定 `agent()` 调用：靠前改动顺流影响下游 prompt、降低复用，靠后改动保留更多
-缓存。
+`resumeFromRunId` reuses the **unchanged** `agent()` results from the previous run.
+Fingerprints are content-addressed (prompt + relevant opts), so even if the concurrent
+scheduling order changes, unchanged calls still hit. When editing the script, try to keep
+the early, stable `agent()` calls: an early change flows downstream into later prompts and
+reduces reuse, while a late change preserves more of the cache.
 
 ## Token Budget
 
-`budget.total` 解析自当前用户消息里的目标（`+500k`、`spend 2M tokens`、`use 1B
-tokens`…），未写为 `None`。`spent()` 是本 run 已完成子代理的 token（输入+输出+推理）。
-达到 `total` 后 `agent()` 抛 `WorkflowLimitExceeded`（run 级硬停）。作用域是**单 run**，
-不是 Claude Code 的每轮共享池——独立工具该有的边界。工具入参 / `meta` / 配置 / 环境
-都不能设 `total`。
+`budget.total` is parsed from a target in the current user message (`+500k`,
+`spend 2M tokens`, `use 1B tokens`, …); `None` if not stated. `spent()` is the token
+count (input + output + reasoning) of this run's completed subagents. Once `total` is
+reached, `agent()` raises `WorkflowLimitExceeded` (a run-level hard stop). The scope is
+**a single run**, not Claude Code's per-turn shared pool — the boundary a standalone tool
+ought to have. Tool inputs / `meta` / config / environment cannot set `total`.
 
-## agentType / worktree / 命名工作流
+## agentType / worktree / Named Workflows
 
-- **agentType**：`agent(agentType="…")` 从工作流 agent 文件加载子代理指令。解析序：
-  项目 `.hermes/dynamic-workflows/agents/<name>.{md,yaml,json}` → 用户
-  `~/.hermes/dynamic-workflows/agents/<name>.…` → 插件内置 `agents/<name>.md`。
-  Markdown 支持 YAML frontmatter（`model` / `toolsets` / `isolation`…）。内置：
-  `explore`、`general-purpose`、`plan`、`verification`。
-- **worktree**：`agent(isolation="worktree")` 在每子代理独立 git worktree 里跑，防
-  并发改同一 checkout 冲突。是工作区隔离、非安全沙箱；用完默认删除（`keep_worktrees`
-  关）。
-- **命名工作流**：`/workflows <runId> save <name> [user|project]` 把脚本存为可复用
-  命名工作流并注册 `/<name>` 斜杠命令（project 写 `.hermes/workflows/<name>.py`，
-  user 写用户库）；`export` 则导出 markdown transcript。
+- **agentType**: `agent(agentType="…")` loads subagent instructions from a workflow agent
+  file. Resolution order: project
+  `.hermes/dynamic-workflows/agents/<name>.{md,yaml,json}` → user
+  `~/.hermes/dynamic-workflows/agents/<name>.…` → the plugin's built-in
+  `agents/<name>.md`. Markdown supports YAML frontmatter (`model` / `toolsets` /
+  `isolation`, …). Built-in: `explore`, `general-purpose`, `plan`, `verification`.
+- **worktree**: `agent(isolation="worktree")` runs each subagent in its own git worktree,
+  preventing conflicts from concurrent edits to the same checkout. This is workspace
+  isolation, not a security sandbox; the worktree is deleted after use by default
+  (`keep_worktrees` off).
 
-## 控制（暂停/恢复/停止/重启）
+## Control (Pause / Resume / Stop / Restart)
 
-独立面板 `hermes-workflows`（另开终端）通过**属主限定、带过期的请求/响应队列**（落在
-插件 store 下，不开本地端口）把控制发回拥有该 run 的 Hermes 进程：
+The standalone dashboard `hermes-workflows` (in a separate terminal) sends control back
+to the Hermes process that owns the run via an **owner-scoped, expiring request/response
+queue** (kept under the plugin store, opening no local port):
 
-- `x` 停止该 run 并打断其活跃子代理。
-- `p` 协作式暂停/恢复：暂停期间不起新子代理或后续 pipeline 阶段（在跑的可跑完），
-  暂停时长不计入 deadline。
-- `r` 用保存的脚本与 args 整体重启为新 Run ID 的全新 run。
-- `s` 存一份 markdown transcript。
+- `x` stops the run and interrupts its active subagents.
+- `p` cooperative pause/resume: while paused, no new subagents or subsequent pipeline
+  stages start (those already running can finish), and paused time does not count toward
+  the deadline.
+- `r` restarts the whole thing as a brand-new run with a new Run ID, using the saved
+  script and args.
+- `s` saves a markdown transcript.
 
-旧版本（无控制属主）的 run 用 `task_stop` / `/workflow-stop` 停。
+## Configuration
 
-## 配置
-
-无独立配置文件：插件从 Hermes 的 `config.yaml` 读
-`plugins.entries.dynamic-workflows.dynamic_workflows:` 一节，并支持
-`HERMES_DYNAMIC_WORKFLOWS_*` 环境变量覆盖。键、默认值与含义见 README 的配置一节。
+No separate config file: the plugin reads the
+`plugins.entries.dynamic-workflows.dynamic_workflows:` section from Hermes's
+`config.yaml`, and supports `HERMES_DYNAMIC_WORKFLOWS_*` environment variable overrides.
+For the keys, defaults, and meanings, see the Configuration section of the README.
