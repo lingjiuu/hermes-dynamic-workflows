@@ -1,5 +1,7 @@
 # Hermes Dynamic Workflows
 
+> **Claude-Code-style dynamic workflows for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
+
 English | [简体中文](./README.zh-CN.md)
 
 You can now use **Dynamic Workflows** in Hermes: have the model write a sandboxed Python

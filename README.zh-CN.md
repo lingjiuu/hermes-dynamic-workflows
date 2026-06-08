@@ -1,8 +1,12 @@
 # Hermes Dynamic Workflows
 
+> **为 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 带来 Claude Code 式的 Dynamic Workflows。**
+
 现在你可以在 Hermes 里使用 **Dynamic Workflows** 了：让模型现写一段受限 Python 脚本，
 后台运行时执行它、用 `agent()/parallel()/pipeline()` 编排大量独立子代理——适合代码库
 审计、大规模迁移、交叉验证的研究。参考自 [Dynamic Workflows in Claude Code](https://claude.com/blog/introducing-dynamic-workflows-in-claude-code)。
+
+https://github.com/user-attachments/assets/06ef3d0d-4d89-48c4-9851-e1cae690e9b0
 
 ## 快速开始
 
