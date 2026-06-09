@@ -2,7 +2,7 @@
 
 > **Claude-Code-style dynamic workflows for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
-English | [简体中文](./README.zh-CN.md) | 日本語
+English | [简体中文](./README.zh-CN.md) | [日本語](./README.ja-JP.md)
 
 You can now use **Dynamic Workflows** in Hermes: have the model write a sandboxed Python
 script on the fly, execute it in the background runtime, and orchestrate large numbers
