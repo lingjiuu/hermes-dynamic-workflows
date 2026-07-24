@@ -32,8 +32,9 @@ def resolve_agent_type(name: str | None, *, cwd: str | None = None) -> AgentType
     if path is not None:
         return _load_agent_type_file(clean, path)
 
+    folded = clean.casefold()
     for spec in list_agent_types(cwd=cwd):
-        if spec.name == clean:
+        if spec.name.casefold() == folded:
             return spec
     return None
 
