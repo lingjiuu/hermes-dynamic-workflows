@@ -531,6 +531,12 @@ class HermesChildAgentRunner(ChildAgentRunner):
                 pass
             with self._active_lock:
                 self._active_children.pop(lease.task_id, None)
+            try:
+                close_child = getattr(child, "close", None)
+                if callable(close_child):
+                    close_child()
+            except Exception:
+                logger.warning("Failed to close child agent %s", lease.task_id, exc_info=True)
             _cleanup_task_cwd(lease.task_id)
             lease.cleanup()
             executor.shutdown(wait=False, cancel_futures=True)
