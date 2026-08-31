@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.core.errors import WorkflowRuntimeError
+from hermes_dynamic_workflows.run.verified_artifact import build_completed_provenance
 from hermes_dynamic_workflows.run import manager as manager_module
 from hermes_dynamic_workflows.run import transcripts as transcripts_module
 from hermes_dynamic_workflows.run.transcripts import (
@@ -384,6 +385,17 @@ class DictRunner(ChildAgentRunner):
         }
 
 
+class CountingVerifiedRunner(ChildAgentRunner):
+    def __init__(self):
+        self.calls = 0
+        self.requests: list[ChildAgentRequest] = []
+
+    def run(self, request: ChildAgentRequest):
+        self.calls += 1
+        self.requests.append(request)
+        return f"verified:{request.label}"
+
+
 class RunManagerTests(unittest.TestCase):
     def setUp(self):
         CountingRunner.calls = 0
@@ -392,6 +404,207 @@ class RunManagerTests(unittest.TestCase):
 
     def tearDown(self):
         self._env_patcher.stop()
+
+    def test_prepare_verified_run_persists_before_approval_and_commit_starts_exactly_once(self):
+        script_bytes = (
+            b'\nmeta = {"name": "verified", "description": "verified workflow"}\n'
+            b'return await agent("inspect", {"label": "worker", "model": "substituted-model", "agentType": "explore", "isolation": "worktree"})\n'
+        )
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+        events: list[tuple[str, str]] = []
+        runner = CountingVerifiedRunner()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+
+            def approve(meta, *, approval_id, execution_digest, authority_preset_id, enforced_max_scale):
+                record = manager.store.list_runs(limit=1)[0]
+                events.append(("approval", record["status"]))
+                self.assertEqual(record["verified"]["approval"]["id"], approval_id)
+                self.assertEqual(record["verified"]["executionDigest"], execution_digest)
+                self.assertEqual(record["verified"]["authorityPresetId"], authority_preset_id)
+                self.assertEqual(record["verified"]["enforcedMaxScale"], enforced_max_scale)
+                self.assertEqual(
+                    manager.store.load_verified_script(
+                        record["runId"],
+                        expected_digest=record["verified"]["scriptDigest"],
+                    ),
+                    script_bytes,
+                )
+                return True, ""
+
+            with (
+                patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", side_effect=approve),
+                patch("hermes_dynamic_workflows.child.runner.HermesChildAgentRunner", return_value=runner),
+            ):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                    args={"k": "v"},
+                )
+                pending_record = manager.get(prepared.run_id)
+                self.assertEqual(events, [("approval", "pending_approval")])
+                self.assertEqual(pending_record["status"], "prepared")
+                self.assertEqual(pending_record["verified"]["state"], "prepared")
+                self.assertIsNone(manager._runs.get(prepared.run_id))
+
+                completed = build_completed_provenance(
+                    prepared,
+                    {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+                )
+                record = manager.commit_prepared_run(prepared, completed)
+                self.assertEqual(record["status"], "queued")
+                final = manager.wait(prepared.run_id, timeout=3)
+
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["result"], "verified:worker")
+        self.assertEqual(runner.calls, 1)
+
+    def test_verified_prepare_denial_and_abort_leave_terminal_records_and_start_nothing(self):
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            with patch(
+                "hermes_dynamic_workflows.run.manager._approve_verified_launch",
+                return_value=(False, "denied"),
+            ):
+                with self.assertRaises(manager_module.WorkflowLaunchDenied):
+                    manager.prepare_verified_run(
+                        script_bytes=script_bytes,
+                        execution_identity=identity,
+                        authority_preset_id="dws-read-only-v1",
+                        enforced_max_scale=1,
+                        cwd=tmp,
+                    )
+
+            denied = manager.store.list_runs(limit=1)[0]
+            self.assertEqual(denied["status"], "denied")
+            self.assertEqual(denied["verified"]["state"], "denied")
+            self.assertFalse(manager._runs)
+
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                )
+
+            aborted_once = manager.abort_prepared_run(prepared, "user-cancelled")
+            aborted_twice = manager.abort_prepared_run(prepared, "user-cancelled")
+
+        self.assertEqual(aborted_once["status"], "aborted")
+        self.assertEqual(aborted_twice["status"], "aborted")
+        self.assertEqual(aborted_once["verified"]["abortReason"], "user-cancelled")
+
+    def test_verified_commit_rejects_tampering_foreign_handles_and_thread_start_failure(self):
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn await agent("inspect", {"label": "worker"})\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp))
+            manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
+            other = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                    args=["a"],
+                )
+
+            tampered = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+            tampered["args"] = ["b"]
+            with self.assertRaises(ValueError):
+                manager.commit_prepared_run(prepared, tampered)
+            self.assertFalse(manager._runs)
+
+            good = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+            with self.assertRaises(ValueError):
+                other.commit_prepared_run(prepared, good)
+            self.assertFalse(other._runs)
+
+            script_path = store.script_path(prepared.run_id)
+            script_path.write_bytes(script_bytes + b"# tampered\n")
+            with self.assertRaises(ValueError):
+                manager.commit_prepared_run(prepared, good)
+            self.assertEqual(manager.get(prepared.run_id)["status"], "prepared")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                )
+            completed = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+            with patch("threading.Thread.start", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    manager.commit_prepared_run(prepared, completed)
+
+            failed = manager.get(prepared.run_id)
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["verified"]["state"], "failed_to_start")
+        self.assertFalse(failed.get("workflow"))
+
+    def test_verified_resume_and_restart_are_rejected_without_affecting_handwritten_runs(self):
+        script = """
+meta = {"name": "handwritten", "description": "workflow"}
+
+return "ok"
+"""
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            handwritten = manager.start_from_params({"script": script}, cwd=tmp)
+            handwritten_final = manager.wait(handwritten["runId"], timeout=2)
+            self.assertEqual(handwritten_final["status"], "completed")
+
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                )
+            completed = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+            manager.commit_prepared_run(prepared, completed)
+            verified_final = manager.wait(prepared.run_id, timeout=2)
+
+            self.assertFalse(manager.resume(prepared.run_id))
+            with self.assertRaises(WorkflowRuntimeError):
+                manager.restart(prepared.run_id)
+            control = manager._handle_control_request({"runId": prepared.run_id, "action": "restart"})
+
+        self.assertEqual(verified_final["status"], "completed")
+        self.assertFalse(control["ok"])
 
     def test_task_output_path_uses_platform_tempdir_and_override(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -823,6 +1036,9 @@ return await agent("do it", {"label": "worker"})
                 "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                 return_value=runner,
             ), patch(
+                "hermes_dynamic_workflows.host.session.create_session_db",
+                side_effect=RuntimeError("force transcript fallback"),
+            ), patch(
                 "hermes_dynamic_workflows.run.transcripts._load_session_messages",
                 side_effect=lambda session_id: list(fake_messages),
             ):
@@ -1239,6 +1455,9 @@ return await agent("do it", {"label": "worker"})
             with patch(
                 "hermes_dynamic_workflows.child.runner.HermesChildAgentRunner",
                 return_value=TranscriptRunner(),
+            ), patch(
+                "hermes_dynamic_workflows.host.session.create_session_db",
+                side_effect=RuntimeError("force transcript fallback"),
             ), patch(
                 "hermes_dynamic_workflows.run.transcripts._load_session_messages",
                 return_value=fake_messages,

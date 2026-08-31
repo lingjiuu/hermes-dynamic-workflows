@@ -23,6 +23,22 @@ class AgentTypeSpec:
     isolation: str | None = None
 
 
+def verified_agent_type_spec(preset: Any) -> AgentTypeSpec:
+    """Materialize a verified preset without consulting mutable agent files."""
+
+    return AgentTypeSpec(
+        name=str(preset.agent_type),
+        instructions=str(preset.instructions),
+        source=f"runtime:verified-authority:{preset.preset_id}",
+        description="Runtime-owned verified DWS authority preset.",
+        toolsets=tuple(preset.toolsets),
+        allowed_tools=tuple(preset.allowed_tools),
+        disallowed_tools=tuple(preset.disallowed_tools),
+        model=None,
+        isolation=str(preset.isolation),
+    )
+
+
 def resolve_agent_type(name: str | None, *, cwd: str | None = None) -> AgentTypeSpec | None:
     clean = str(name or "").strip()
     if not clean:

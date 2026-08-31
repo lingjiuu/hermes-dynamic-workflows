@@ -17,6 +17,7 @@ from dataclasses import replace
 from typing import Any
 
 from .presets import AgentTypeSpec, list_agent_types, resolve_agent_type
+from .verified_authority import VerifiedAuthorityEnforcer
 from .worktree import WorkspaceLease, create_workspace_lease
 from ..core.config import PluginConfig
 from ..core.errors import ChildAgentError, ChildAgentSkipped, WorkflowTimeout
@@ -121,6 +122,7 @@ class HermesChildAgentRunner(ChildAgentRunner):
         approval_callback: Any = None,
         approval_session_key: str | None = None,
         parent_runtime: dict[str, Any] | None = None,
+        verified_authority_context: Any = None,
     ):
         self.config = config
         # Captured gateway session vars (platform/session_key/chat_id/...) from
@@ -137,12 +139,19 @@ class HermesChildAgentRunner(ChildAgentRunner):
         # children and model="inherit" use the active session runtime, including
         # a non-persisted /model switch, without leaking credentials to run data.
         self._parent_runtime = dict(parent_runtime) if parent_runtime else None
+        self._verified_authority = (
+            VerifiedAuthorityEnforcer(verified_authority_context)
+            if verified_authority_context is not None
+            else None
+        )
         self._active_children: dict[str, Any] = {}
         self._skipped_children: set[str] = set()
         self._active_lock = threading.RLock()
         self._progress_print_lock = threading.RLock()
 
     def run(self, request: ChildAgentRequest) -> ChildAgentResult:
+        if self._verified_authority is not None:
+            request = self._verified_authority.constrain(request)
         task_id = f"workflow-{uuid.uuid4().hex[:12]}"
         base_cwd = request.cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
         resolved = request.resolved

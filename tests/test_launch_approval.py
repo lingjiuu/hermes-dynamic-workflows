@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from hermes_dynamic_workflows.core.config import PluginConfig
-from hermes_dynamic_workflows.run.manager import _approve_launch
+from hermes_dynamic_workflows.run.manager import _approve_launch, _approve_verified_launch
 
 META = {"name": "demo", "description": "a workflow"}
 
@@ -44,12 +44,15 @@ def fake_approval(
     appr._ApprovalEntry = ApprovalEntry
 
     def notify(*a, **k):
+        if a:
+            appr._last_notified.append(a[0])
         queue = appr._gateway_queues.get("sess", [])
         if queue and gateway_choice != "timeout":
             queue[-1].result = gateway_choice
             queue[-1].event.set()
 
     appr._gateway_notify_cbs = {"sess": notify} if notify_present else {}
+    appr._last_notified = []
     if legacy_wait:
         appr._await_gateway_decision = lambda sk, cb, data, surface=None: {
             "resolved": True,
@@ -74,7 +77,7 @@ def fake_approval(
         modules["tools.environments.base"] = base
 
     with patch.dict(sys.modules, modules):
-        yield
+        yield appr
 
 
 class LaunchApprovalConfigTests(unittest.TestCase):
@@ -133,6 +136,42 @@ class LaunchApprovalDecisionTests(unittest.TestCase):
             approved, reason = _approve_launch(META, PluginConfig(), None)
         self.assertFalse(approved)
         self.assertIn("no interactive channel", reason)
+
+    def test_verified_launch_approval_remains_mandatory_when_config_flag_is_off(self):
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_INTERACTIVE"}
+        with fake_approval(gateway=False), patch.dict(os.environ, env, clear=True):
+            approved, reason = _approve_verified_launch(
+                META,
+                approval_id="wfa_test-1",
+                execution_digest="a" * 64,
+                authority_preset_id="dws-read-only-v1",
+                enforced_max_scale=4,
+            )
+        self.assertFalse(approved)
+        self.assertIn("approval required", reason)
+
+    def test_verified_gateway_approval_binds_digest_preset_and_scale(self):
+        with fake_approval(gateway=True, gateway_choice="once") as approval:
+            approved, _ = _approve_verified_launch(
+                META,
+                approval_id="wfa_test-2",
+                execution_digest="b" * 64,
+                authority_preset_id="dws-read-only-v1",
+                enforced_max_scale=7,
+            )
+
+        self.assertTrue(approved)
+        queued = approval._gateway_queues.get("sess", [])
+        self.assertEqual(queued, [])
+        # notify() receives the same data object placed in the queue entry.
+        # The fake helper resolves immediately, so inspect the last entry data.
+        last = approval._last_notified[-1]
+        self.assertEqual(last["approval_id"], "wfa_test-2")
+        self.assertEqual(last["execution_digest"], "b" * 64)
+        self.assertEqual(last["authority_preset_id"], "dws-read-only-v1")
+        self.assertEqual(last["enforced_max_scale"], 7)
+        self.assertIn("dws-read-only-v1", last["description"])
+        self.assertIn("bbbbbbbb", last["description"])
 
 
 if __name__ == "__main__":

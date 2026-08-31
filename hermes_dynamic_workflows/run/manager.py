@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import threading
 import time
 import traceback
@@ -20,12 +21,19 @@ from ..engine.sandbox import extract_meta, parse_script
 from ..core.token_budget import parse_token_budget
 from ..storage.store import (
     WorkflowStore,
+    new_approval_id,
     new_run_id,
     new_task_id,
     resolve_workflow_source,
     sanitize_filename,
     utc_now_iso,
 )
+from ..run.verified_artifact import (
+    PreparedRun,
+    make_pending_provenance,
+    validate_completed_provenance,
+)
+from ..child.verified_authority import lock_verified_authority
 from ..storage.control import ControlListener, new_control_owner
 from ..view.render import (
     render_agent_overview,
@@ -62,6 +70,18 @@ class ManagedRun:
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
+@dataclass
+class _PreparedState:
+    nonce: str
+    record: dict[str, Any]
+    plugin_context: Any = None
+    session_context: dict[str, str] | None = None
+    approval_callback: Any = None
+    parent_runtime: dict[str, Any] | None = None
+    verified_authority_context: Any = None
+    state: str = "prepared"
+
+
 class WorkflowRunManager:
     def __init__(
         self,
@@ -74,6 +94,7 @@ class WorkflowRunManager:
         self.config = config or load_config()
         self.control_owner = new_control_owner()
         self._runs: dict[str, ManagedRun] = {}
+        self._prepared: dict[str, _PreparedState] = {}
         self._lock = threading.RLock()
         self._control_listener: ControlListener | None = None
         if enable_control:
@@ -241,6 +262,269 @@ class WorkflowRunManager:
         thread.start()
         return self._public_record(record)
 
+    def prepare_verified_run(
+        self,
+        *,
+        script_bytes: bytes,
+        execution_identity: dict[str, Any],
+        authority_preset_id: str,
+        enforced_max_scale: int,
+        cwd: str | None = None,
+        args: Any = None,
+        plugin_context: Any = None,
+        parent_agent: Any = None,
+        host_session_id: str | None = None,
+        user_task: str | None = None,
+        session_context_override: dict[str, str] | None = None,
+        approval_callback_override: Any = None,
+        parent_runtime_override: dict[str, Any] | None = None,
+    ) -> PreparedRun:
+        if not isinstance(script_bytes, bytes):
+            raise TypeError("verified workflow script must be immutable bytes")
+        cwd_value = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
+        script_text = script_bytes.decode("utf-8")
+        config = self.config
+        meta = extract_meta(parse_script(script_text, config))
+        run_id = new_run_id()
+        task_id = new_task_id()
+        approval_id = new_approval_id()
+        workflow_session_id = _resolve_workflow_session_id(
+            plugin_context,
+            host_session_id=host_session_id,
+        )
+        session_context = (
+            session_context_override
+            if session_context_override is not None
+            else _capture_gateway_session_context()
+        )
+        approval_callback = (
+            approval_callback_override
+            if approval_callback_override is not None
+            else _capture_cli_approval_callback()
+        )
+        parent_runtime = (
+            dict(parent_runtime_override)
+            if parent_runtime_override is not None
+            else _capture_parent_runtime(parent_agent, plugin_context=plugin_context)
+        )
+
+        execution_digest = hashlib.sha256(
+            b"hermes-dws-execution-identity-v1\0"
+            + json.dumps(
+                execution_identity,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        verified_authority = lock_verified_authority(
+            authority_preset_id,
+            enforced_max_scale=enforced_max_scale,
+            cwd=cwd_value,
+            execution_digest=execution_digest,
+        )
+        pending = make_pending_provenance(
+            run_id=run_id,
+            task_id=task_id,
+            approval_id=approval_id,
+            script_bytes=script_bytes,
+            execution_identity=execution_identity,
+            authority_preset_id=verified_authority.preset_id,
+            authority_policy_digest=verified_authority.policy_digest,
+            enforced_max_scale=verified_authority.enforced_max_scale,
+            cwd=verified_authority.cwd,
+            args=args,
+        )
+        script_path = self.store.save_verified_script(
+            run_id,
+            script_bytes,
+            expected_digest=pending["scriptDigest"],
+        )
+        self.store.save_verified_provenance(run_id, pending)
+        token_budget = parse_token_budget(user_task)
+        record = {
+            "runId": run_id,
+            "taskId": task_id,
+            "status": "pending_approval",
+            "createdAt": utc_now_iso(),
+            "startedAt": None,
+            "finishedAt": None,
+            "cwd": verified_authority.cwd,
+            "workflowSessionId": workflow_session_id,
+            "controlOwner": self.control_owner if self._control_listener is not None else None,
+            "scriptPath": str(script_path),
+            "transcriptDir": "",
+            "journalFile": "",
+            "summary": meta.get("description") or meta.get("name") or "verified workflow",
+            "source": {
+                "type": "verified",
+                "ref": "immutable-bytes",
+            },
+            "resumeFromRunId": None,
+            "restartedFromRunId": None,
+            "args": pending["args"],
+            "tokenBudget": token_budget,
+            "result": None,
+            "error": None,
+            "display": "",
+            "workflow": None,
+            "agentCache": {},
+            "outputFile": None,
+            "transcriptFiles": [],
+            "transcriptMetaFiles": [],
+            "verified": {
+                "contractVersion": pending["version"],
+                "state": "pending_approval",
+                "runId": run_id,
+                "taskId": task_id,
+                "approval": {"id": approval_id, "status": "pending"},
+                "scriptDigest": pending["scriptDigest"],
+                "executionDigest": pending["executionDigest"],
+                "executionIdentity": pending["executionIdentity"],
+                "authorityPresetId": pending["authorityPresetId"],
+                "authorityPolicyDigest": pending["authorityPolicyDigest"],
+                "enforcedMaxScale": pending["enforcedMaxScale"],
+                "resumeSupported": False,
+                "restartSupported": False,
+                "provenancePath": str(self.store.verified_provenance_path(run_id)),
+            },
+        }
+        self.store.save_run(record)
+        approved, reason = _approve_verified_launch(
+            meta,
+            approval_id=approval_id,
+            execution_digest=pending["executionDigest"],
+            authority_preset_id=pending["authorityPresetId"],
+            enforced_max_scale=pending["enforcedMaxScale"],
+        )
+        if not approved:
+            record["status"] = "denied"
+            record["finishedAt"] = utc_now_iso()
+            record["error"] = reason
+            record["verified"]["state"] = "denied"
+            record["verified"]["approval"] = {"id": approval_id, "status": "denied", "reason": reason}
+            self.store.save_run(record)
+            raise WorkflowLaunchDenied(
+                f'Workflow "{meta.get("name") or "workflow"}" was not launched: {reason}. '
+                "Do not retry; tell the user it needs their approval."
+            )
+        record["status"] = "prepared"
+        record["verified"]["state"] = "prepared"
+        record["verified"]["approval"] = {"id": approval_id, "status": "approved"}
+        self.store.save_run(record)
+        prepared = PreparedRun.from_pending(pending, script_path=str(script_path), nonce=secrets.token_hex(16))
+        with self._lock:
+            self._prepared[run_id] = _PreparedState(
+                nonce=prepared._nonce,
+                record=dict(record),
+                plugin_context=plugin_context,
+                session_context=session_context,
+                approval_callback=approval_callback,
+                parent_runtime=parent_runtime,
+                verified_authority_context=verified_authority,
+            )
+        return prepared
+
+    def commit_prepared_run(
+        self,
+        prepared: PreparedRun,
+        completed_provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = self._validated_prepared_state(prepared)
+        if state.state != "prepared":
+            raise ValueError("prepared run is no longer pending")
+        validate_completed_provenance(prepared, completed_provenance)
+        script_bytes = self.store.load_verified_script(
+            prepared.run_id,
+            expected_digest=prepared.script_digest,
+        )
+        self.store.save_verified_provenance(prepared.run_id, completed_provenance)
+        record = dict(state.record)
+        transcript_dir = self.store.transcript_dir(
+            str(record.get("cwd") or ""),
+            str(record.get("workflowSessionId") or ""),
+            prepared.run_id,
+        )
+        journal_path = transcript_dir / "journal.jsonl"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        journal_path.touch(exist_ok=True)
+        record["status"] = "queued"
+        record["transcriptDir"] = str(transcript_dir)
+        record["journalFile"] = str(journal_path)
+        record["verified"]["state"] = "queued"
+        record["verified"]["provenance"] = completed_provenance
+        record["verified"]["completedProvenancePath"] = str(
+            self.store.verified_provenance_path(prepared.run_id)
+        )
+        record["verified"]["approval"]["status"] = "approved"
+        self.store.save_run(record)
+        managed = ManagedRun(
+            run_id=prepared.run_id,
+            stop_event=threading.Event(),
+            pause_gate=PauseGate(),
+            record=record,
+            plugin_context=state.plugin_context,
+            session_context=state.session_context,
+            approval_callback=state.approval_callback,
+            parent_runtime=state.parent_runtime,
+        )
+        script = script_bytes.decode("utf-8")
+        thread = threading.Thread(
+            target=self._run_thread,
+            args=(
+                managed,
+                script,
+                record.get("args"),
+                self.config,
+                ResumeCache(),
+                record.get("cwd"),
+                state.plugin_context,
+                record.get("tokenBudget"),
+                state.session_context,
+                state.verified_authority_context,
+            ),
+            name=f"workflow-{prepared.run_id}",
+            daemon=True,
+        )
+        managed.thread = thread
+        result_record = self._public_record(dict(record))
+        with self._lock:
+            self._runs[prepared.run_id] = managed
+            state.state = "committed"
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._runs.pop(prepared.run_id, None)
+            record["status"] = "failed"
+            record["finishedAt"] = utc_now_iso()
+            record["error"] = "thread-start failure"
+            record["verified"]["state"] = "failed_to_start"
+            self.store.save_run(record)
+            state.record = dict(record)
+            raise
+        state.record = dict(record)
+        return result_record
+
+    def abort_prepared_run(self, prepared: PreparedRun, reason: str) -> dict[str, Any]:
+        state = self._validated_prepared_state(prepared)
+        if state.state == "aborted":
+            return self._public_record(dict(state.record))
+        if state.state != "prepared":
+            raise ValueError("prepared run is no longer pending")
+        record = dict(state.record)
+        record["status"] = "aborted"
+        record["finishedAt"] = utc_now_iso()
+        record["error"] = str(reason)
+        record["verified"]["state"] = "aborted"
+        record["verified"]["abortReason"] = str(reason)
+        self.store.save_run(record)
+        with self._lock:
+            state.state = "aborted"
+            state.record = dict(record)
+        return self._public_record(record)
+
     def get(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
             managed = self._runs.get(run_id)
@@ -377,6 +661,9 @@ class WorkflowRunManager:
         return True
 
     def resume(self, run_id: str) -> bool:
+        record = self.store.load_run(run_id)
+        if _is_verified_record(record):
+            return False
         with self._lock:
             managed = self._runs.get(run_id)
         if managed is None:
@@ -394,6 +681,8 @@ class WorkflowRunManager:
         record = self.get(run_id)
         if record is None:
             return None
+        if _is_verified_record(record):
+            raise WorkflowRuntimeError("verified workflow restart/resume is unsupported")
         with self._lock:
             managed = self._runs.get(run_id)
         if managed is not None and record.get("status") in {"queued", "running", "paused", "stopping"}:
@@ -447,10 +736,14 @@ class WorkflowRunManager:
             message = f"Paused {run_id}; running agents may finish." if ok else f"Workflow {run_id} is not pausable."
             return {"ok": ok, "action": action, "runId": run_id, "status": "paused" if ok else record.get("status"), "message": message}
         if action == "resume":
+            if _is_verified_record(record):
+                return {"ok": False, "action": action, "runId": run_id, "status": record.get("status"), "message": "Verified workflow resume is unsupported."}
             ok = self.resume(run_id)
             message = f"Resumed {run_id}." if ok else f"Workflow {run_id} is not paused."
             return {"ok": ok, "action": action, "runId": run_id, "status": "running" if ok else record.get("status"), "message": message}
         if action == "restart":
+            if _is_verified_record(record):
+                return {"ok": False, "action": action, "runId": run_id, "status": record.get("status"), "message": "Verified workflow restart is unsupported."}
             restarted = self.restart(run_id)
             if restarted is None:
                 return {"ok": False, "action": action, "runId": run_id, "message": f"Workflow run not found: {run_id}"}
@@ -520,6 +813,22 @@ class WorkflowRunManager:
             managed.thread.join(timeout=timeout)
         return self.get(run_id)
 
+    def _validated_prepared_state(self, prepared: PreparedRun) -> _PreparedState:
+        if not isinstance(prepared, PreparedRun):
+            raise TypeError("prepared run handle is invalid")
+        with self._lock:
+            state = self._prepared.get(prepared.run_id)
+        if state is None:
+            raise ValueError("prepared run handle does not belong to this live manager")
+        if state.nonce != prepared._nonce:
+            raise ValueError("prepared run handle does not belong to this live manager")
+        stored_pending = self.store.load_verified_provenance(prepared.run_id)
+        if stored_pending != prepared.pending_provenance:
+            raise ValueError("prepared run provenance was substituted or tampered")
+        if state.state not in {"prepared", "aborted"}:
+            raise ValueError("prepared run is no longer pending")
+        return state
+
     def _run_thread(
         self,
         managed: ManagedRun,
@@ -531,6 +840,7 @@ class WorkflowRunManager:
         plugin_context: Any,
         token_budget: int | None = None,
         session_context: dict[str, str] | None = None,
+        verified_authority_context: Any = None,
     ) -> None:
         try:
             from ..child.runner import HermesChildAgentRunner
@@ -540,6 +850,8 @@ class WorkflowRunManager:
                 "approval_session_key": _workflow_approval_session_key(managed, session_context),
                 "parent_runtime": managed.parent_runtime,
             }
+            if verified_authority_context is not None:
+                runner_kwargs["verified_authority_context"] = verified_authority_context
             if managed.approval_callback is not None:
                 runner_kwargs["approval_callback"] = managed.approval_callback
             managed.child_runner = HermesChildAgentRunner(config, **runner_kwargs)
@@ -899,6 +1211,13 @@ def _workflow_approval_session_key(
     )
 
 
+def _is_verified_record(record: dict[str, Any] | None) -> bool:
+    if not isinstance(record, dict):
+        return False
+    verified = record.get("verified")
+    return isinstance(verified, dict) and str(record.get("source", {}).get("type") or "") == "verified"
+
+
 def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: Any) -> tuple[bool, str]:
     """Gate a top-level workflow launch when ``require_launch_approval`` is on.
 
@@ -962,6 +1281,72 @@ def _approve_launch(meta: dict[str, Any], config: PluginConfig, plugin_context: 
         "(set require_launch_approval=false / HERMES_DYNAMIC_WORKFLOWS_REQUIRE_LAUNCH_APPROVAL=0 "
         "for unattended/headless use)"
     )
+
+
+def _approve_verified_launch(
+    meta: dict[str, Any],
+    *,
+    approval_id: str,
+    execution_digest: str,
+    authority_preset_id: str,
+    enforced_max_scale: int,
+) -> tuple[bool, str]:
+    name = str(meta.get("name") or "workflow")
+    desc = str(meta.get("description") or "")
+    digest_preview = execution_digest[:8]
+    label = f"verified-workflow-launch:{approval_id}"
+    human = (
+        f'Launch verified dynamic workflow "{name}"'
+        + (f" - {desc}" if desc else "")
+        + f" [approval={approval_id}, executionDigest={digest_preview}, "
+        + f"authorityPreset={authority_preset_id}, enforcedMaxScale={enforced_max_scale}]"
+    )
+
+    try:
+        from tools import approval as _approval
+    except Exception:
+        return False, "verified launch approval required but Hermes' approval engine is unavailable"
+
+    try:
+        if _approval._is_gateway_approval_context():
+            session_key = _approval.get_current_session_key()
+            notify_cb = _approval._gateway_notify_cbs.get(session_key)
+            if notify_cb is None:
+                return False, "verified launch approval required but no gateway approval channel is registered"
+            decision = _await_gateway_launch_decision(
+                _approval,
+                session_key,
+                notify_cb,
+                {
+                    "command": label,
+                    "pattern_key": "verified_workflow_launch",
+                    "pattern_keys": ["verified_workflow_launch"],
+                    "description": human,
+                    "approval_id": approval_id,
+                    "execution_digest": execution_digest,
+                    "authority_preset_id": authority_preset_id,
+                    "enforced_max_scale": enforced_max_scale,
+                },
+            )
+            ok = bool(decision.get("resolved")) and decision.get("choice") not in (None, "deny")
+            return (True, "") if ok else (False, "verified workflow launch was denied or timed out")
+    except Exception as exc:
+        return False, f"verified launch approval failed: {type(exc).__name__}: {exc}"
+
+    if (os.environ.get("HERMES_INTERACTIVE") or "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from tools.terminal_tool import _get_approval_callback
+
+            cb = _get_approval_callback()
+        except Exception:
+            cb = None
+        try:
+            choice = _approval.prompt_dangerous_approval(label, human, approval_callback=cb)
+        except Exception as exc:
+            return False, f"verified launch approval prompt failed: {type(exc).__name__}: {exc}"
+        return (True, "") if (choice and choice != "deny") else (False, "verified workflow launch was denied")
+
+    return False, "verified launch approval required but no interactive channel is available"
 
 
 def _await_gateway_launch_decision(_approval: Any, session_key: str, notify_cb: Any, data: dict[str, Any]) -> dict[str, Any]:

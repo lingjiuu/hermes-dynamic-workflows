@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -61,6 +62,10 @@ class WorkflowStore:
         _validate_run_id(run_id)
         return self.scripts_dir / f"{run_id}.py"
 
+    def verified_provenance_path(self, run_id: str) -> Path:
+        _validate_run_id(run_id)
+        return self.runs_dir / f"{run_id}.provenance.json"
+
     def session_dir(self, cwd: str | None, session_id: str) -> Path:
         return self.layout_root / "projects" / sanitize_path(cwd or "") / session_id
 
@@ -94,8 +99,27 @@ class WorkflowStore:
 
     def save_script(self, run_id: str, script: str) -> Path:
         path = self.script_path(run_id)
-        path.write_text(script, encoding="utf-8")
+        _atomic_replace_bytes(path, script.encode("utf-8"))
         return path
+
+    def save_verified_script(self, run_id: str, script_bytes: bytes, *, expected_digest: str) -> Path:
+        path = self.script_path(run_id)
+        _atomic_replace_bytes(path, script_bytes)
+        stored = path.read_bytes()
+        if stored != script_bytes:
+            raise OSError(f"verified workflow script readback mismatch for {path}")
+        actual_digest = _verified_script_digest(stored)
+        if actual_digest != str(expected_digest):
+            raise ValueError("verified workflow script digest did not match after persistence")
+        return path
+
+    def load_verified_script(self, run_id: str, *, expected_digest: str) -> bytes:
+        path = self.script_path(run_id)
+        data = path.read_bytes()
+        actual_digest = _verified_script_digest(data)
+        if actual_digest != str(expected_digest):
+            raise ValueError("verified workflow script digest mismatch")
+        return data
 
     def save_workflow_script(
         self,
@@ -108,15 +132,31 @@ class WorkflowStore:
     ) -> Path:
         path = self.workflow_script_path(cwd, session_id, run_id, name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(script, encoding="utf-8")
+        _atomic_replace_bytes(path, script.encode("utf-8"))
         return path
 
     def save_run(self, record: dict[str, Any]) -> None:
         run_id = str(record.get("runId") or "")
         path = self.run_path(run_id)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        tmp.replace(path)
+        _atomic_replace_bytes(
+            path,
+            json.dumps(record, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+        )
+
+    def save_verified_provenance(self, run_id: str, provenance: dict[str, Any]) -> Path:
+        path = self.verified_provenance_path(run_id)
+        payload = _canonical_json_bytes(provenance)
+        _atomic_replace_bytes(path, payload)
+        if path.read_bytes() != payload:
+            raise OSError(f"verified provenance readback mismatch for {path}")
+        return path
+
+    def load_verified_provenance(self, run_id: str) -> dict[str, Any] | None:
+        path = self.verified_provenance_path(run_id)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
         path = self.run_path(run_id)
@@ -304,3 +344,37 @@ def _resolve_script_path(raw: str, cwd: str | None) -> Path:
     if path.stat().st_size > 1024 * 1024:
         raise WorkflowParseError(f"workflow scriptPath is too large: {path}")
     return path
+
+
+def new_approval_id() -> str:
+    raw = uuid.uuid4().hex
+    return f"wfa_{raw[:10]}-{raw[10:14]}"
+
+
+def _atomic_replace_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+    except BaseException:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _verified_script_digest(script_bytes: bytes) -> str:
+    return hashlib.sha256(b"hermes-dws-immutable-script-v1\0" + script_bytes).hexdigest()

@@ -134,6 +134,42 @@ At runtime the plugin persists the script and the full execution trace (transcri
 every child agent, and injects a `<task-notification>` into the conversation on
 completion — no polling required. Use `/workflows` to view history and details.
 
+## Verified Execution API
+
+The handwritten `Workflow(...)` tool path above is unchanged. Verified execution is a
+separate two-phase manager API for callers that already hold immutable workflow bytes
+and a versioned execution-identity envelope:
+
+```python
+prepared = manager.prepare_verified_run(
+    script_bytes=script_bytes,
+    execution_identity=identity_envelope,
+    authority_preset_id="dws-read-only-v1",
+    enforced_max_scale=4,
+    cwd="/trusted/project",
+    args={"ticket": "ABC-123"},
+)
+
+record = manager.commit_prepared_run(
+    prepared,
+    prepared.completed_provenance(
+        {
+            "completedAt": "2026-08-31T12:00:00+00:00",
+            "compilerReceipt": "build-123",
+        }
+    ),
+)
+```
+
+Verified launch guarantees:
+
+- `prepare_verified_run(...)` persists the exact immutable bytes and a pending provenance record before requesting approval.
+- Verified launch approval is always required, even when `require_launch_approval: false` is set for handwritten workflows.
+- `commit_prepared_run(...)` only accepts the original live prepared handle, requires completed provenance that binds the prepared digests/identity/preset/scale/cwd/args, persists that provenance before thread start, and executes the stored verified bytes.
+- `abort_prepared_run(...)` leaves an auditable terminal record and starts no thread or child.
+- Verified child agents are clamped to the runtime-owned authority preset; document code cannot widen tools, toolsets, isolation, model policy, request overrides, agent type, cwd, or scale.
+- Verified restart and resume are intentionally unsupported in this first contract.
+
 ## Deep Dive
 
 For implementation details (core execution path, tools and full call results, prompt

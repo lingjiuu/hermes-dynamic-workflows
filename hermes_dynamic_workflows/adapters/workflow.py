@@ -57,21 +57,23 @@ def _launch_message(record: dict[str, Any]) -> str:
     summary = record.get("summary") or "Dynamic workflow"
     transcript_dir = record.get("transcriptDir") or ""
     script_path = record.get("scriptPath") or ""
-    return "\n".join(
-        [
-            f"Workflow launched in background. Workflow Task ID: {task_id}",
-            f"Summary: {summary}",
-            f"Transcript dir: {transcript_dir}",
-            f"Script file: {script_path}",
-            f"Run ID: {run_id}",
-            (
-                "To resume after editing the script: "
-                f"Workflow({{scriptPath: {json.dumps(script_path, ensure_ascii=False)}, "
-                f"resumeFromRunId: {json.dumps(run_id)}}})"
-            ),
-            "You will be notified when it completes. Use /workflows to watch live progress.",
-        ]
-    )
+    lines = [
+        f"Workflow launched in background. Workflow Task ID: {task_id}",
+        f"Summary: {summary}",
+        f"Transcript dir: {transcript_dir}",
+        f"Script file: {script_path}",
+        f"Run ID: {run_id}",
+    ]
+    if str(record.get("source", {}).get("type") or "") == "verified":
+        lines.append("Verified runs execute persisted exact bytes and do not support restart or resume.")
+    else:
+        lines.append(
+            "To resume after editing the script: "
+            f"Workflow({{scriptPath: {json.dumps(script_path, ensure_ascii=False)}, "
+            f"resumeFromRunId: {json.dumps(run_id)}}})"
+        )
+    lines.append("You will be notified when it completes. Use /workflows to watch live progress.")
+    return "\n".join(lines)
 
 
 def _short_traceback() -> str:
