@@ -884,6 +884,84 @@ class StructuredOutputContinuationTests(unittest.TestCase):
         self.assertEqual(child.calls[0][2], lease.task_id)
         self.assertEqual(child.calls[1][2], lease.task_id)
 
+    def test_runner_closes_child_after_success(self):
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="closing-child", cwd="/tmp")
+
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.closed = False
+
+            def run_conversation(self, **_):
+                return {"final_response": "done", "messages": [], "completed": True}
+
+            def close(self):
+                self.closed = True
+
+        child = Child()
+        result = HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+            child,
+            request,
+            lease,
+            None,
+            [],
+        )
+
+        self.assertEqual(result.content, "done")
+        self.assertTrue(child.closed)
+
+    def test_runner_closes_child_after_failure(self):
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="failing-child", cwd="/tmp")
+
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.closed = False
+
+            def run_conversation(self, **_):
+                return {"final_response": "", "messages": [], "error": "provider failed"}
+
+            def close(self):
+                self.closed = True
+
+        child = Child()
+        with self.assertRaisesRegex(ChildAgentError, "provider failed"):
+            HermesChildAgentRunner(PluginConfig())._run_child_with_timeout(
+                child,
+                request,
+                lease,
+                None,
+                [],
+            )
+
+        self.assertTrue(child.closed)
+
     def test_runner_fails_after_maximum_missing_submissions(self):
         schema = {"type": "object"}
         request = ChildAgentRequest(
