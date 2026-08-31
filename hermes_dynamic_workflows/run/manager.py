@@ -31,6 +31,7 @@ from ..storage.store import (
 )
 from ..run.verified_artifact import (
     PreparedRun,
+    canonical_json_bytes,
     make_pending_provenance,
     validate_completed_provenance,
 )
@@ -440,12 +441,13 @@ class WorkflowRunManager:
                 raise ValueError("prepared run is no longer pending")
             state.state = "committing"
         try:
-            validate_completed_provenance(prepared, completed_provenance)
+            completed_snapshot = json.loads(canonical_json_bytes(completed_provenance).decode("utf-8"))
+            validate_completed_provenance(prepared, completed_snapshot)
             script_bytes = self.store.load_verified_script(
                 prepared.run_id,
                 expected_digest=prepared.script_digest,
             )
-            self.store.save_verified_provenance(prepared.run_id, completed_provenance)
+            self.store.save_verified_provenance(prepared.run_id, completed_snapshot)
             record = self._record_snapshot(state.record)
             transcript_dir = self.store.transcript_dir(
                 str(record.get("cwd") or ""),
@@ -459,7 +461,7 @@ class WorkflowRunManager:
             record["transcriptDir"] = str(transcript_dir)
             record["journalFile"] = str(journal_path)
             record["verified"]["state"] = "queued"
-            record["verified"]["provenance"] = deepcopy(completed_provenance)
+            record["verified"]["provenance"] = completed_snapshot
             record["verified"]["completedProvenancePath"] = str(
                 self.store.verified_provenance_path(prepared.run_id)
             )

@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from hermes_dynamic_workflows.core.config import PluginConfig
 from hermes_dynamic_workflows.core.errors import WorkflowRuntimeError
-from hermes_dynamic_workflows.run.verified_artifact import build_completed_provenance
+from hermes_dynamic_workflows.run.verified_artifact import build_completed_provenance, canonical_json_bytes
 from hermes_dynamic_workflows.run import manager as manager_module
 from hermes_dynamic_workflows.run import transcripts as transcripts_module
 from hermes_dynamic_workflows.run.transcripts import (
@@ -733,6 +733,89 @@ class RunManagerTests(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["verified"]["state"], "failed_to_start")
         self.assertFalse(failed.get("workflow"))
+
+    def test_verified_commit_snapshots_completed_provenance_before_validation(self):
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+
+        class ImmediateThread:
+            created = 0
+            starts = 0
+            target_calls = 0
+            lock = threading.Lock()
+
+            def __init__(self, *, target, args, name, daemon):
+                self._target = target
+                self._args = args
+                self.name = name
+                self.daemon = daemon
+                with type(self).lock:
+                    type(self).created += 1
+
+            def start(self):
+                with type(self).lock:
+                    type(self).starts += 1
+                self._target(*self._args)
+                with type(self).lock:
+                    type(self).target_calls += 1
+
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp))
+            manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                    args={"bound": "original"},
+                )
+            completed = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+            original_validate = manager_module.validate_completed_provenance
+
+            def mutate_after_validation(prepared_run, completed_provenance):
+                original_validate(prepared_run, completed_provenance)
+                completed["args"]["bound"] = "tampered-after-validation"
+
+            with (
+                patch("threading.Thread", ImmediateThread),
+                patch.object(manager, "_run_thread", return_value=None),
+                patch.object(manager_module, "validate_completed_provenance", side_effect=mutate_after_validation),
+            ):
+                result = manager.commit_prepared_run(prepared, completed)
+
+            persisted = store.load_verified_provenance(prepared.run_id)
+            record = store.load_run(prepared.run_id)
+            current = manager.get(prepared.run_id)
+
+            completed["args"]["bound"] = "tampered-after-return"
+            result["verified"]["provenance"]["args"]["bound"] = "tampered-returned-record"
+
+            persisted_after_return = store.load_verified_provenance(prepared.run_id)
+            record_after_return = store.load_run(prepared.run_id)
+            current_after_return = manager.get(prepared.run_id)
+
+        self.assertEqual(ImmediateThread.created, 1)
+        self.assertEqual(ImmediateThread.starts, 1)
+        self.assertEqual(ImmediateThread.target_calls, 1)
+        self.assertEqual(prepared.pending_provenance["args"], {"bound": "original"})
+        self.assertEqual(persisted["args"], {"bound": "original"})
+        self.assertEqual(record["verified"]["provenance"]["args"], {"bound": "original"})
+        self.assertEqual(current["verified"]["provenance"]["args"], {"bound": "original"})
+        self.assertEqual(persisted_after_return["args"], {"bound": "original"})
+        self.assertEqual(record_after_return["verified"]["provenance"]["args"], {"bound": "original"})
+        self.assertEqual(current_after_return["verified"]["provenance"]["args"], {"bound": "original"})
+        self.assertEqual(
+            canonical_json_bytes(persisted),
+            canonical_json_bytes(record["verified"]["provenance"]),
+        )
 
     def test_verified_commit_is_reserved_atomically_before_persistence_or_thread_start(self):
         script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
