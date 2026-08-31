@@ -1017,8 +1017,14 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             toolsets=[],
         )
         lease = WorkspaceLease(task_id="timed-out-child", cwd="/tmp")
+        started = threading.Event()
         release = threading.Event()
         finished = threading.Event()
+        caller_done = threading.Event()
+        cwd_cleaned = threading.Event()
+        lease_cleaned = threading.Event()
+        cleanup_after_finish: list[tuple[str, bool]] = []
+        errors: list[BaseException] = []
 
         class Child:
             session_prompt_tokens = 0
@@ -1032,6 +1038,7 @@ class StructuredOutputContinuationTests(unittest.TestCase):
                 self.closed = threading.Event()
 
             def run_conversation(self, **_):
+                started.set()
                 release.wait(timeout=2)
                 finished.set()
                 return {"final_response": "done", "messages": [], "completed": True}
@@ -1040,21 +1047,60 @@ class StructuredOutputContinuationTests(unittest.TestCase):
                 pass
 
             def close(self):
+                cleanup_after_finish.append(("close", finished.is_set()))
                 self.closed.set()
 
+        def cleanup_task_cwd(_task_id):
+            cleanup_after_finish.append(("task-cwd", finished.is_set()))
+            cwd_cleaned.set()
+
+        def cleanup_lease():
+            cleanup_after_finish.append(("lease", finished.is_set()))
+            lease_cleaned.set()
+
         child = Child()
-        runner = HermesChildAgentRunner(PluginConfig(child_timeout_seconds=0.01))
-        try:
-            with self.assertRaisesRegex(WorkflowTimeout, "child agent timed out"):
+        runner = HermesChildAgentRunner(PluginConfig(child_timeout_seconds=0.05))
+
+        def invoke_runner():
+            try:
                 runner._run_child_with_timeout(child, request, lease, None, [])
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                caller_done.set()
 
-            self.assertFalse(finished.is_set())
-            self.assertFalse(child.closed.is_set())
-        finally:
-            release.set()
+        caller = threading.Thread(target=invoke_runner, daemon=True)
+        with (
+            patch(
+                "hermes_dynamic_workflows.child.runner._cleanup_task_cwd",
+                side_effect=cleanup_task_cwd,
+            ),
+            patch.object(lease, "cleanup", side_effect=cleanup_lease),
+        ):
+            try:
+                caller.start()
+                self.assertTrue(started.wait(timeout=1))
+                self.assertTrue(caller_done.wait(timeout=1))
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], WorkflowTimeout)
+                self.assertIn("child agent timed out", str(errors[0]))
+                self.assertFalse(finished.is_set())
+                self.assertFalse(child.closed.is_set())
+                self.assertFalse(cwd_cleaned.is_set())
+                self.assertFalse(lease_cleaned.is_set())
+            finally:
+                release.set()
+                caller.join(timeout=1)
 
-        self.assertTrue(finished.wait(timeout=1))
-        self.assertTrue(child.closed.wait(timeout=1))
+            self.assertTrue(finished.wait(timeout=1))
+            self.assertTrue(child.closed.wait(timeout=1))
+            self.assertTrue(cwd_cleaned.wait(timeout=1))
+            self.assertTrue(lease_cleaned.wait(timeout=1))
+
+        self.assertEqual(
+            cleanup_after_finish,
+            [("close", True), ("task-cwd", True), ("lease", True)],
+        )
 
 
 class ConfigDefaultsTests(unittest.TestCase):

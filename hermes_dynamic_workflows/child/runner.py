@@ -546,20 +546,26 @@ class HermesChildAgentRunner(ChildAgentRunner):
             with self._active_lock:
                 self._active_children.pop(lease.task_id, None)
 
-            def _close_child(_future: Any) -> None:
+            def _cleanup_child(_future: Any) -> None:
                 try:
                     close_child = getattr(child, "close", None)
                     if callable(close_child):
                         close_child()
                 except Exception:
                     logger.warning("Failed to close child agent %s", lease.task_id, exc_info=True)
+                try:
+                    _cleanup_task_cwd(lease.task_id)
+                except Exception:
+                    logger.warning("Failed to clean child task state %s", lease.task_id, exc_info=True)
+                try:
+                    lease.cleanup()
+                except Exception:
+                    logger.warning("Failed to clean child workspace %s", lease.task_id, exc_info=True)
 
             # A timed-out future may still be executing: cancel_futures only
-            # prevents queued work from starting. Close from the completion
-            # callback so teardown never races run_conversation.
-            future.add_done_callback(_close_child)
-            _cleanup_task_cwd(lease.task_id)
-            lease.cleanup()
+            # prevents queued work from starting. Transfer all worker-owned
+            # teardown to the completion callback so it cannot race the child.
+            future.add_done_callback(_cleanup_child)
             executor.shutdown(wait=False, cancel_futures=True)
 
     def interrupt_all(self) -> None:
