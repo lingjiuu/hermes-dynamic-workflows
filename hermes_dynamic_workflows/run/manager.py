@@ -9,6 +9,7 @@ import secrets
 import threading
 import time
 import traceback
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -419,7 +420,7 @@ class WorkflowRunManager:
         with self._lock:
             self._prepared[run_id] = _PreparedState(
                 nonce=prepared._nonce,
-                record=dict(record),
+                record=self._record_snapshot(record),
                 plugin_context=plugin_context,
                 session_context=session_context,
                 approval_callback=approval_callback,
@@ -445,7 +446,7 @@ class WorkflowRunManager:
                 expected_digest=prepared.script_digest,
             )
             self.store.save_verified_provenance(prepared.run_id, completed_provenance)
-            record = dict(state.record)
+            record = self._record_snapshot(state.record)
             transcript_dir = self.store.transcript_dir(
                 str(record.get("cwd") or ""),
                 str(record.get("workflowSessionId") or ""),
@@ -458,7 +459,7 @@ class WorkflowRunManager:
             record["transcriptDir"] = str(transcript_dir)
             record["journalFile"] = str(journal_path)
             record["verified"]["state"] = "queued"
-            record["verified"]["provenance"] = completed_provenance
+            record["verified"]["provenance"] = deepcopy(completed_provenance)
             record["verified"]["completedProvenancePath"] = str(
                 self.store.verified_provenance_path(prepared.run_id)
             )
@@ -468,7 +469,7 @@ class WorkflowRunManager:
                 run_id=prepared.run_id,
                 stop_event=threading.Event(),
                 pause_gate=PauseGate(),
-                record=record,
+                record=self._record_snapshot(record),
                 plugin_context=state.plugin_context,
                 session_context=state.session_context,
                 approval_callback=state.approval_callback,
@@ -493,13 +494,13 @@ class WorkflowRunManager:
                 daemon=True,
             )
             managed.thread = thread
-            result_record = self._public_record(dict(record))
+            result_record = self._public_record(record)
             with self._lock:
                 self._runs[prepared.run_id] = managed
                 state.state = "committed"
-                state.record = dict(record)
+                state.record = self._record_snapshot(record)
         except BaseException as exc:
-            record = dict(state.record)
+            record = self._record_snapshot(state.record)
             record["status"] = "failed"
             record["finishedAt"] = utc_now_iso()
             record["error"] = str(exc)
@@ -509,7 +510,7 @@ class WorkflowRunManager:
             self.store.save_run(record)
             with self._lock:
                 state.state = "failed"
-                state.record = dict(record)
+                state.record = self._record_snapshot(record)
             raise
         try:
             thread.start()
@@ -523,34 +524,58 @@ class WorkflowRunManager:
             self.store.save_run(record)
             with self._lock:
                 state.state = "failed"
-                state.record = dict(record)
+                state.record = self._record_snapshot(record)
             raise
         return result_record
 
     def abort_prepared_run(self, prepared: PreparedRun, reason: str) -> dict[str, Any]:
         state = self._validated_prepared_state(prepared)
+        abort_reason = str(reason)
         if state.state == "aborted":
-            return self._public_record(dict(state.record))
-        if state.state != "prepared":
-            raise ValueError("prepared run is no longer pending")
-        record = dict(state.record)
+            existing_reason = str(state.record.get("verified", {}).get("abortReason") or "")
+            if existing_reason != abort_reason:
+                raise ValueError("prepared run was already aborted for a different reason")
+            return self._public_record(state.record)
+        with self._lock:
+            if state.state != "prepared":
+                raise ValueError("prepared run is no longer pending")
+            state.state = "aborting"
+        record = self._record_snapshot(state.record)
         record["status"] = "aborted"
         record["finishedAt"] = utc_now_iso()
-        record["error"] = str(reason)
+        record["error"] = abort_reason
         record["verified"]["state"] = "aborted"
-        record["verified"]["abortReason"] = str(reason)
-        self.store.save_run(record)
+        record["verified"]["abortReason"] = abort_reason
+        try:
+            self.store.save_run(record)
+        except BaseException as exc:
+            failure_record = self._record_snapshot(record)
+            failure_record["status"] = "failed"
+            failure_record["finishedAt"] = utc_now_iso()
+            failure_record["error"] = f"abort persistence failed: {type(exc).__name__}: {exc}"
+            failure_record["verified"]["state"] = "failed_abort"
+            with self._lock:
+                state.state = "failed_abort"
+                state.record = self._record_snapshot(failure_record)
+            try:
+                self.store.save_run(failure_record)
+            except Exception:
+                pass
+            raise
         with self._lock:
             state.state = "aborted"
-            state.record = dict(record)
+            state.record = self._record_snapshot(record)
         return self._public_record(record)
 
     def get(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
             managed = self._runs.get(run_id)
+            prepared = self._prepared.get(run_id)
         if managed:
             with managed.lock:
-                return self._public_record(dict(managed.record))
+                return self._public_record(managed.record)
+        if prepared is not None:
+            return self._public_record(prepared.record)
         record = self.store.load_run(run_id)
         return self._public_record(record) if record else None
 
@@ -1019,7 +1044,10 @@ class WorkflowRunManager:
             self.store.save_run(managed.record)
 
     def _public_record(self, record: dict[str, Any]) -> dict[str, Any]:
-        return dict(record)
+        return self._record_snapshot(record)
+
+    def _record_snapshot(self, record: dict[str, Any]) -> dict[str, Any]:
+        return deepcopy(record)
 
     def _append_journal_event(self, managed: ManagedRun, event: dict[str, Any]) -> None:
         with managed.lock:

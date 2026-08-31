@@ -503,6 +503,171 @@ class RunManagerTests(unittest.TestCase):
         self.assertEqual(aborted_twice["status"], "aborted")
         self.assertEqual(aborted_once["verified"]["abortReason"], "user-cancelled")
 
+    def test_verified_abort_reservation_blocks_commit_and_keeps_snapshots_isolated(self):
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+
+        class AbortBarrierStore(WorkflowStore):
+            def __init__(self, root: Path):
+                super().__init__(root)
+                self.abort_save_entered = threading.Event()
+                self.release_abort_save = threading.Event()
+
+            def save_run(self, record: dict[str, object]) -> None:
+                verified = record.get("verified")
+                if (
+                    record.get("status") == "aborted"
+                    and isinstance(verified, dict)
+                    and verified.get("state") == "aborted"
+                    and not self.abort_save_entered.is_set()
+                ):
+                    self.abort_save_entered.set()
+                    self.release_abort_save.wait(timeout=5)
+                return super().save_run(record)
+
+        class ManagedThread:
+            created = 0
+            starts = 0
+            lock = threading.Lock()
+
+            def __init__(self, *, target, args, name, daemon):
+                self._target = target
+                self._args = args
+                self.name = name
+                self.daemon = daemon
+                with type(self).lock:
+                    type(self).created += 1
+
+            def start(self):
+                with type(self).lock:
+                    type(self).starts += 1
+
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AbortBarrierStore(Path(tmp))
+            manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                )
+            completed = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+            abort_outcome: dict[str, object] = {}
+            real_thread = threading.Thread
+
+            def abort_run():
+                try:
+                    abort_outcome["result"] = manager.abort_prepared_run(prepared, "user-cancelled")
+                except Exception as exc:
+                    abort_outcome["error"] = exc
+
+            with patch("hermes_dynamic_workflows.run.manager.threading.Thread", ManagedThread):
+                abort_thread = real_thread(target=abort_run)
+                abort_thread.start()
+                self.assertTrue(store.abort_save_entered.wait(timeout=5))
+                try:
+                    with self.assertRaises(ValueError):
+                        manager.commit_prepared_run(prepared, completed)
+                finally:
+                    store.release_abort_save.set()
+                abort_thread.join(timeout=5)
+
+            persisted = manager.store.load_run(prepared.run_id)
+            final = manager.get(prepared.run_id)
+
+        self.assertNotIn("error", abort_outcome)
+        self.assertEqual(abort_outcome["result"]["status"], "aborted")
+        self.assertEqual(ManagedThread.created, 0)
+        self.assertEqual(ManagedThread.starts, 0)
+        self.assertEqual(persisted["status"], "aborted")
+        self.assertEqual(persisted["verified"]["state"], "aborted")
+        self.assertEqual(final["status"], "aborted")
+        self.assertEqual(final["verified"]["state"], "aborted")
+        self.assertEqual(final["verified"]["abortReason"], "user-cancelled")
+
+    def test_verified_abort_persistence_failure_is_terminal_and_noncommittable(self):
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+
+        class FailingAbortStore(WorkflowStore):
+            def __init__(self, root: Path):
+                super().__init__(root)
+                self.abort_failures = 0
+
+            def save_run(self, record: dict[str, object]) -> None:
+                verified = record.get("verified")
+                if (
+                    record.get("status") == "aborted"
+                    and isinstance(verified, dict)
+                    and verified.get("state") == "aborted"
+                ):
+                    self.abort_failures += 1
+                    raise OSError("abort write failed")
+                return super().save_run(record)
+
+        class ManagedThread:
+            created = 0
+            starts = 0
+            lock = threading.Lock()
+
+            def __init__(self, *, target, args, name, daemon):
+                self._target = target
+                self._args = args
+                self.name = name
+                self.daemon = daemon
+                with type(self).lock:
+                    type(self).created += 1
+
+            def start(self):
+                with type(self).lock:
+                    type(self).starts += 1
+
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FailingAbortStore(Path(tmp))
+            manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                )
+            completed = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+
+            with self.assertRaises(OSError):
+                manager.abort_prepared_run(prepared, "user-cancelled")
+
+            failure = manager.get(prepared.run_id)
+            persisted = manager.store.load_run(prepared.run_id)
+
+            with patch("hermes_dynamic_workflows.run.manager.threading.Thread", ManagedThread):
+                with self.assertRaises(ValueError):
+                    manager.commit_prepared_run(prepared, completed)
+
+        self.assertEqual(store.abort_failures, 1)
+        self.assertEqual(ManagedThread.created, 0)
+        self.assertEqual(ManagedThread.starts, 0)
+        self.assertEqual(failure["status"], "failed")
+        self.assertEqual(failure["verified"]["state"], "failed_abort")
+        self.assertEqual(failure["verified"]["abortReason"], "user-cancelled")
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["verified"]["state"], "failed_abort")
+
     def test_verified_commit_rejects_tampering_foreign_handles_and_thread_start_failure(self):
         script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn await agent("inspect", {"label": "worker"})\n'
         identity = {"version": "dws-execution-identity/v1", "target": "demo"}
