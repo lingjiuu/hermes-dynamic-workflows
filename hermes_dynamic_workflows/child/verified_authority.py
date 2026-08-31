@@ -29,11 +29,13 @@ class VerifiedAuthorityPreset:
     model_policy: str
     allow_request_overrides: bool
     maximum_scale: int
+    allow_structured_output: bool
 
     def policy_record(self) -> dict[str, object]:
         return {
             "agentType": self.agent_type,
             "allowRequestOverrides": self.allow_request_overrides,
+            "allowStructuredOutput": self.allow_structured_output,
             "allowedTools": list(self.allowed_tools),
             "disallowedTools": list(self.disallowed_tools),
             "instructions": self.instructions,
@@ -52,12 +54,13 @@ _READ_ONLY = VerifiedAuthorityPreset(
         "Read and analyze only; do not mutate files or external state."
     ),
     toolsets=("web", "file", "terminal"),
-    allowed_tools=("web_search", "web_extract", "read_file", "search_files", "terminal"),
+    allowed_tools=("web_search", "web_extract", "read_file", "search_files", "terminal", "structured_output"),
     disallowed_tools=("write_file", "patch", "process", "skill_manage"),
     isolation="shared",
     model_policy="inherit",
     allow_request_overrides=False,
     maximum_scale=64,
+    allow_structured_output=True,
 )
 
 VERIFIED_AUTHORITY_PRESETS: Mapping[str, VerifiedAuthorityPreset] = MappingProxyType(
@@ -145,6 +148,8 @@ class VerifiedAuthorityEnforcer:
         preset = self._validated_preset()
         if request.request_overrides:
             raise ChildAgentError("verified workflow children forbid provider request overrides")
+        if (request.schema is not None or request.structured_tool) and not preset.allow_structured_output:
+            raise ChildAgentError("verified workflow child structured output is not allowed by the locked preset")
         request_cwd = str(Path(request.cwd or "").expanduser().resolve())
         if request_cwd != self.context.cwd:
             raise ChildAgentError(

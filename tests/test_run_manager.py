@@ -542,7 +542,8 @@ class RunManagerTests(unittest.TestCase):
             script_path.write_bytes(script_bytes + b"# tampered\n")
             with self.assertRaises(ValueError):
                 manager.commit_prepared_run(prepared, good)
-            self.assertEqual(manager.get(prepared.run_id)["status"], "prepared")
+            self.assertEqual(manager.get(prepared.run_id)["status"], "failed")
+            self.assertEqual(manager.get(prepared.run_id)["verified"]["state"], "failed_commit")
 
         with tempfile.TemporaryDirectory() as tmp:
             manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
@@ -567,6 +568,109 @@ class RunManagerTests(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["verified"]["state"], "failed_to_start")
         self.assertFalse(failed.get("workflow"))
+
+    def test_verified_commit_is_reserved_atomically_before_persistence_or_thread_start(self):
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+        completed_at = "2026-08-31T12:00:00+00:00"
+
+        class BarrierStore(WorkflowStore):
+            def __init__(self, root: Path):
+                super().__init__(root)
+                self.provenance_saves = 0
+                self._count_lock = threading.Lock()
+                self._first_save_entered = threading.Event()
+                self._second_save_entered = threading.Event()
+
+            def save_verified_provenance(self, run_id: str, provenance: dict[str, object]) -> Path:
+                if provenance.get("state") == "completed":
+                    if not self._first_save_entered.is_set():
+                        self._first_save_entered.set()
+                        self._second_save_entered.wait(timeout=0.5)
+                    else:
+                        self._second_save_entered.set()
+                    with self._count_lock:
+                        self.provenance_saves += 1
+                return super().save_verified_provenance(run_id, provenance)
+
+        class ImmediateThread:
+            created = 0
+            starts = 0
+            target_calls = 0
+            lock = threading.Lock()
+
+            def __init__(self, *, target, args, name, daemon):
+                self._target = target
+                self._args = args
+                self.name = name
+                self.daemon = daemon
+                with type(self).lock:
+                    type(self).created += 1
+
+            def start(self):
+                with type(self).lock:
+                    type(self).starts += 1
+                self._target(*self._args)
+                with type(self).lock:
+                    type(self).target_calls += 1
+
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = BarrierStore(Path(tmp))
+            manager = WorkflowRunManager(store=store, config=PluginConfig(require_launch_approval=False))
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                )
+            completed = build_completed_provenance(
+                prepared,
+                {"completedAt": completed_at, "compilerReceipt": "ok"},
+            )
+            outcomes: list[tuple[str, object]] = []
+            outcomes_lock = threading.Lock()
+            real_thread = threading.Thread
+
+            def attempt_commit():
+                try:
+                    result = manager.commit_prepared_run(prepared, completed)
+                except Exception as exc:
+                    payload = ("error", exc)
+                else:
+                    payload = ("ok", result["runId"])
+                with outcomes_lock:
+                    outcomes.append(payload)
+
+            with (
+                patch("threading.Thread", ImmediateThread),
+                patch.object(manager, "_run_thread", return_value=None),
+            ):
+                first = real_thread(target=attempt_commit)
+                second = real_thread(target=attempt_commit)
+                first.start()
+                second.start()
+                first.join(timeout=5)
+                second.join(timeout=5)
+
+            successes = [payload for status, payload in outcomes if status == "ok"]
+            failures = [payload for status, payload in outcomes if status == "error"]
+            final = manager.get(prepared.run_id)
+
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(successes[0], prepared.run_id)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], ValueError)
+        self.assertEqual(str(failures[0]), "prepared run is no longer pending")
+        self.assertEqual(store.provenance_saves, 1)
+        self.assertEqual(ImmediateThread.created, 1)
+        self.assertEqual(ImmediateThread.starts, 1)
+        self.assertEqual(ImmediateThread.target_calls, 1)
+        self.assertEqual(final["verified"]["state"], "queued")
 
     def test_verified_resume_and_restart_are_rejected_without_affecting_handwritten_runs(self):
         script = """
@@ -605,6 +709,55 @@ return "ok"
 
         self.assertEqual(verified_final["status"], "completed")
         self.assertFalse(control["ok"])
+
+    def test_start_from_params_rejects_resume_from_verified_run_before_new_thread_creation(self):
+        script = """
+meta = {"name": "handwritten", "description": "workflow"}
+
+return "ok"
+"""
+        script_bytes = b'meta = {"name": "verified", "description": "verified workflow"}\nreturn "ok"\n'
+        identity = {"version": "dws-execution-identity/v1", "target": "demo"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = WorkflowRunManager(store=WorkflowStore(Path(tmp)), config=PluginConfig(require_launch_approval=False))
+            handwritten = manager.start_from_params({"script": script}, cwd=tmp)
+            handwritten_final = manager.wait(handwritten["runId"], timeout=2)
+            self.assertEqual(handwritten_final["status"], "completed")
+
+            with patch("hermes_dynamic_workflows.run.manager._approve_verified_launch", return_value=(True, "")):
+                prepared = manager.prepare_verified_run(
+                    script_bytes=script_bytes,
+                    execution_identity=identity,
+                    authority_preset_id="dws-read-only-v1",
+                    enforced_max_scale=1,
+                    cwd=tmp,
+                )
+            completed = build_completed_provenance(
+                prepared,
+                {"completedAt": "2026-08-31T12:00:00+00:00", "compilerReceipt": "ok"},
+            )
+            manager.commit_prepared_run(prepared, completed)
+            verified_final = manager.wait(prepared.run_id, timeout=2)
+            thread_creations = 0
+
+            def fail_if_thread_created(*args, **kwargs):
+                nonlocal thread_creations
+                thread_creations += 1
+                raise AssertionError("resume from verified run must fail before thread creation")
+
+            before_runs = set(manager._runs)
+            with patch("threading.Thread", side_effect=fail_if_thread_created):
+                with self.assertRaises(WorkflowRuntimeError):
+                    manager.start_from_params(
+                        {"script": script, "resumeFromRunId": prepared.run_id},
+                        cwd=tmp,
+                    )
+            after_runs = set(manager._runs)
+
+        self.assertEqual(verified_final["status"], "completed")
+        self.assertEqual(thread_creations, 0)
+        self.assertEqual(after_runs, before_runs)
 
     def test_task_output_path_uses_platform_tempdir_and_override(self):
         with tempfile.TemporaryDirectory() as tmp:

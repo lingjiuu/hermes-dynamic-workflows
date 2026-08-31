@@ -786,8 +786,6 @@ def _filter_child_tool_definitions(
 ) -> list[dict[str, Any]]:
     allowed = {name for item in allowed_tools if (name := str(item).strip())}
     disallowed = {name for item in disallowed_tools if (name := str(item).strip())}
-    if allowed:
-        allowed.add(STRUCTURED_OUTPUT_TOOL_NAME)
     filtered: list[dict[str, Any]] = []
     for definition in definitions:
         name = _tool_definition_name(definition)

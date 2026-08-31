@@ -179,6 +179,8 @@ class WorkflowRunManager:
         transcript_dir.mkdir(parents=True, exist_ok=True)
         journal_path.touch(exist_ok=True)
         previous = self.store.load_run(resume_from) if resume_from else None
+        if previous is not None and _is_verified_record(previous):
+            raise WorkflowRuntimeError("verified workflow restart/resume is unsupported")
         resume_cache = ResumeCache.from_run(previous)
         args = params["args"] if "args" in params else None
         token_budget = (
@@ -432,66 +434,83 @@ class WorkflowRunManager:
         completed_provenance: dict[str, Any],
     ) -> dict[str, Any]:
         state = self._validated_prepared_state(prepared)
-        if state.state != "prepared":
-            raise ValueError("prepared run is no longer pending")
-        validate_completed_provenance(prepared, completed_provenance)
-        script_bytes = self.store.load_verified_script(
-            prepared.run_id,
-            expected_digest=prepared.script_digest,
-        )
-        self.store.save_verified_provenance(prepared.run_id, completed_provenance)
-        record = dict(state.record)
-        transcript_dir = self.store.transcript_dir(
-            str(record.get("cwd") or ""),
-            str(record.get("workflowSessionId") or ""),
-            prepared.run_id,
-        )
-        journal_path = transcript_dir / "journal.jsonl"
-        transcript_dir.mkdir(parents=True, exist_ok=True)
-        journal_path.touch(exist_ok=True)
-        record["status"] = "queued"
-        record["transcriptDir"] = str(transcript_dir)
-        record["journalFile"] = str(journal_path)
-        record["verified"]["state"] = "queued"
-        record["verified"]["provenance"] = completed_provenance
-        record["verified"]["completedProvenancePath"] = str(
-            self.store.verified_provenance_path(prepared.run_id)
-        )
-        record["verified"]["approval"]["status"] = "approved"
-        self.store.save_run(record)
-        managed = ManagedRun(
-            run_id=prepared.run_id,
-            stop_event=threading.Event(),
-            pause_gate=PauseGate(),
-            record=record,
-            plugin_context=state.plugin_context,
-            session_context=state.session_context,
-            approval_callback=state.approval_callback,
-            parent_runtime=state.parent_runtime,
-        )
-        script = script_bytes.decode("utf-8")
-        thread = threading.Thread(
-            target=self._run_thread,
-            args=(
-                managed,
-                script,
-                record.get("args"),
-                self.config,
-                ResumeCache(),
-                record.get("cwd"),
-                state.plugin_context,
-                record.get("tokenBudget"),
-                state.session_context,
-                state.verified_authority_context,
-            ),
-            name=f"workflow-{prepared.run_id}",
-            daemon=True,
-        )
-        managed.thread = thread
-        result_record = self._public_record(dict(record))
         with self._lock:
-            self._runs[prepared.run_id] = managed
-            state.state = "committed"
+            if state.state != "prepared":
+                raise ValueError("prepared run is no longer pending")
+            state.state = "committing"
+        try:
+            validate_completed_provenance(prepared, completed_provenance)
+            script_bytes = self.store.load_verified_script(
+                prepared.run_id,
+                expected_digest=prepared.script_digest,
+            )
+            self.store.save_verified_provenance(prepared.run_id, completed_provenance)
+            record = dict(state.record)
+            transcript_dir = self.store.transcript_dir(
+                str(record.get("cwd") or ""),
+                str(record.get("workflowSessionId") or ""),
+                prepared.run_id,
+            )
+            journal_path = transcript_dir / "journal.jsonl"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            journal_path.touch(exist_ok=True)
+            record["status"] = "queued"
+            record["transcriptDir"] = str(transcript_dir)
+            record["journalFile"] = str(journal_path)
+            record["verified"]["state"] = "queued"
+            record["verified"]["provenance"] = completed_provenance
+            record["verified"]["completedProvenancePath"] = str(
+                self.store.verified_provenance_path(prepared.run_id)
+            )
+            record["verified"]["approval"]["status"] = "approved"
+            self.store.save_run(record)
+            managed = ManagedRun(
+                run_id=prepared.run_id,
+                stop_event=threading.Event(),
+                pause_gate=PauseGate(),
+                record=record,
+                plugin_context=state.plugin_context,
+                session_context=state.session_context,
+                approval_callback=state.approval_callback,
+                parent_runtime=state.parent_runtime,
+            )
+            script = script_bytes.decode("utf-8")
+            thread = threading.Thread(
+                target=self._run_thread,
+                args=(
+                    managed,
+                    script,
+                    record.get("args"),
+                    self.config,
+                    ResumeCache(),
+                    record.get("cwd"),
+                    state.plugin_context,
+                    record.get("tokenBudget"),
+                    state.session_context,
+                    state.verified_authority_context,
+                ),
+                name=f"workflow-{prepared.run_id}",
+                daemon=True,
+            )
+            managed.thread = thread
+            result_record = self._public_record(dict(record))
+            with self._lock:
+                self._runs[prepared.run_id] = managed
+                state.state = "committed"
+                state.record = dict(record)
+        except BaseException as exc:
+            record = dict(state.record)
+            record["status"] = "failed"
+            record["finishedAt"] = utc_now_iso()
+            record["error"] = str(exc)
+            verified = record.get("verified")
+            if isinstance(verified, dict):
+                verified["state"] = "failed_commit"
+            self.store.save_run(record)
+            with self._lock:
+                state.state = "failed"
+                state.record = dict(record)
+            raise
         try:
             thread.start()
         except BaseException:
@@ -502,9 +521,10 @@ class WorkflowRunManager:
             record["error"] = "thread-start failure"
             record["verified"]["state"] = "failed_to_start"
             self.store.save_run(record)
-            state.record = dict(record)
+            with self._lock:
+                state.state = "failed"
+                state.record = dict(record)
             raise
-        state.record = dict(record)
         return result_record
 
     def abort_prepared_run(self, prepared: PreparedRun, reason: str) -> dict[str, Any]:
