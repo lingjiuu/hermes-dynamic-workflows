@@ -4,6 +4,8 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import sys
+import types
 from unittest.mock import patch
 
 from hermes_dynamic_workflows.child.runner import HermesChildAgentRunner
@@ -20,6 +22,20 @@ from hermes_dynamic_workflows.core.types import ChildAgentRequest
 
 
 class VerifiedAuthorityPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _runner_config():
+        return type(
+            "Config",
+            (),
+            {
+                "keep_worktrees": False,
+                "allow_model_override": True,
+                "default_child_toolsets": ["web", "file", "terminal"],
+                "blocked_child_toolsets": [],
+                "child_approval_policy": "approve",
+            },
+        )()
+
     def test_policy_bytes_and_digest_are_stable_public_contracts(self):
         first = verified_authority_policy_bytes()
         second = verified_authority_policy_bytes()
@@ -390,6 +406,128 @@ class VerifiedAuthorityPolicyTests(unittest.TestCase):
         self.assertEqual(constrained.isolation, "shared")
         self.assertIsNone(constrained.request_overrides)
         self.assertEqual(observed["toolsets"], ["web", "file", "terminal"])
+
+    def test_verified_runner_does_not_inherit_parent_runtime_request_overrides(self):
+        with TemporaryDirectory() as tmp:
+            context = lock_verified_authority(
+                "dws-read-only-v1",
+                enforced_max_scale=1,
+                cwd=tmp,
+                execution_digest="1" * 64,
+            )
+            runner = HermesChildAgentRunner(
+                config=self._runner_config(),
+                parent_runtime={
+                    "model": "session-switched-model",
+                    "provider": "custom:session",
+                    "request_overrides": {
+                        "temperature": 1.7,
+                        "custom_body": {"unsafe": True},
+                    },
+                },
+                verified_authority_context=context,
+            )
+            request = ChildAgentRequest(
+                id=9,
+                prompt="inspect",
+                label="worker",
+                phase=None,
+                toolsets=[],
+                cwd=tmp,
+            )
+            observed: dict[str, object] = {}
+
+            class FakeAIAgent:
+                def __init__(self, **kwargs):
+                    observed["agent_kwargs"] = dict(kwargs)
+                    self.tools = []
+                    self.valid_tool_names = set()
+
+            run_agent_mod = types.ModuleType("run_agent")
+            run_agent_mod.AIAgent = FakeAIAgent
+
+            def fake_run_child(child, constrained_request, lease, agent_type, toolsets):
+                observed["request"] = constrained_request
+                return "ok"
+
+            with (
+                patch.dict(sys.modules, {"run_agent": run_agent_mod}),
+                patch(
+                    "hermes_dynamic_workflows.child.runner.create_workspace_lease",
+                    return_value=type(
+                        "Lease",
+                        (),
+                        {"task_id": "lease-verified", "cwd": tmp, "path": tmp, "repo_root": None, "isolation": "shared"},
+                    )(),
+                ),
+                patch("hermes_dynamic_workflows.child.runner._prepare_mcp_tool_registry"),
+                patch("hermes_dynamic_workflows.child.runner._configure_child_tools"),
+                patch.object(runner, "_run_child_with_timeout", side_effect=fake_run_child),
+            ):
+                result = runner.run(request)
+
+        self.assertEqual(result, "ok")
+        self.assertIsNone(observed["request"].request_overrides)
+        self.assertNotIn("request_overrides", observed["agent_kwargs"])
+
+    def test_handwritten_runner_still_inherits_parent_runtime_request_overrides(self):
+        runner = HermesChildAgentRunner(
+            config=self._runner_config(),
+            parent_runtime={
+                "model": "session-switched-model",
+                "provider": "custom:session",
+                "request_overrides": {
+                    "temperature": 1.7,
+                    "custom_body": {"unsafe": True},
+                },
+            },
+        )
+        request = ChildAgentRequest(
+            id=10,
+            prompt="inspect",
+            label="worker",
+            phase=None,
+            toolsets=[],
+            model="inherit",
+            cwd="/tmp",
+        )
+        observed: dict[str, object] = {}
+
+        class FakeAIAgent:
+            def __init__(self, **kwargs):
+                observed["agent_kwargs"] = dict(kwargs)
+                self.tools = []
+                self.valid_tool_names = set()
+
+        run_agent_mod = types.ModuleType("run_agent")
+        run_agent_mod.AIAgent = FakeAIAgent
+
+        def fake_run_child(child, constrained_request, lease, agent_type, toolsets):
+            observed["request"] = constrained_request
+            return "ok"
+
+        with (
+            patch.dict(sys.modules, {"run_agent": run_agent_mod}),
+            patch(
+                "hermes_dynamic_workflows.child.runner.create_workspace_lease",
+                return_value=type(
+                    "Lease",
+                    (),
+                    {"task_id": "lease-handwritten", "cwd": "/tmp", "path": "/tmp", "repo_root": None, "isolation": "shared"},
+                )(),
+            ),
+            patch("hermes_dynamic_workflows.child.runner._prepare_mcp_tool_registry"),
+            patch("hermes_dynamic_workflows.child.runner._configure_child_tools"),
+            patch.object(runner, "_run_child_with_timeout", side_effect=fake_run_child),
+        ):
+            result = runner.run(request)
+
+        self.assertEqual(result, "ok")
+        self.assertIsNone(observed["request"].request_overrides)
+        self.assertEqual(
+            observed["agent_kwargs"]["request_overrides"],
+            {"temperature": 1.7, "custom_body": {"unsafe": True}},
+        )
 
 
 if __name__ == "__main__":

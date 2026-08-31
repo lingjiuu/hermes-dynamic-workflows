@@ -352,8 +352,13 @@ class HermesChildAgentRunner(ChildAgentRunner):
             "session_db": session_db,
             "session_id": lease.task_id,
         }
-        request_overrides = request.request_overrides or runtime.get("request_overrides")
-        if request_overrides and _callable_accepts_keyword(AIAgent, "request_overrides"):
+        if self._verified_authority is not None:
+            request_overrides = request.request_overrides
+        elif request.request_overrides is not None:
+            request_overrides = request.request_overrides
+        else:
+            request_overrides = runtime.get("request_overrides")
+        if request_overrides is not None and _callable_accepts_keyword(AIAgent, "request_overrides"):
             kwargs["request_overrides"] = request_overrides
         if runtime.get("reasoning_config") is not None:
             kwargs["reasoning_config"] = runtime["reasoning_config"]
