@@ -5,6 +5,7 @@ import os
 import io
 import subprocess
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -30,7 +31,7 @@ from hermes_dynamic_workflows.child.runner import (
 )
 from hermes_dynamic_workflows.child.worktree import WorkspaceLease, create_workspace_lease
 from hermes_dynamic_workflows.core.config import PluginConfig
-from hermes_dynamic_workflows.core.errors import ChildAgentError
+from hermes_dynamic_workflows.core.errors import ChildAgentError, WorkflowTimeout
 from hermes_dynamic_workflows.core.types import ChildAgentRequest
 from hermes_dynamic_workflows.child.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
@@ -1006,6 +1007,54 @@ class StructuredOutputContinuationTests(unittest.TestCase):
 
         self.assertIn("Failed to provide valid structured output", str(ctx.exception))
         self.assertEqual(child.calls, MAX_STRUCTURED_OUTPUT_RETRIES)
+
+    def test_runner_defers_close_until_timed_out_child_finishes(self):
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="timed-out-child", cwd="/tmp")
+        release = threading.Event()
+        finished = threading.Event()
+
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def __init__(self):
+                self.closed = threading.Event()
+
+            def run_conversation(self, **_):
+                release.wait(timeout=2)
+                finished.set()
+                return {"final_response": "done", "messages": [], "completed": True}
+
+            def interrupt(self):
+                pass
+
+            def close(self):
+                self.closed.set()
+
+        child = Child()
+        runner = HermesChildAgentRunner(PluginConfig(child_timeout_seconds=0.01))
+        try:
+            with self.assertRaisesRegex(WorkflowTimeout, "child agent timed out"):
+                runner._run_child_with_timeout(child, request, lease, None, [])
+
+            self.assertFalse(finished.is_set())
+            self.assertFalse(child.closed.is_set())
+        finally:
+            release.set()
+
+        self.assertTrue(finished.wait(timeout=1))
+        self.assertTrue(child.closed.wait(timeout=1))
 
 
 class ConfigDefaultsTests(unittest.TestCase):
