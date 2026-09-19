@@ -18,6 +18,7 @@ from typing import Any
 
 from .presets import AgentTypeSpec, list_agent_types, resolve_agent_type
 from .worktree import WorkspaceLease, create_workspace_lease
+from .._hermes_compat import resolve
 from ..core.config import PluginConfig
 from ..core.errors import ChildAgentError, ChildAgentSkipped, WorkflowTimeout
 from .structured_output import (
@@ -441,12 +442,10 @@ class HermesChildAgentRunner(ChildAgentRunner):
             reset_current_session_key = None
             if self._approval_session_key:
                 try:
-                    from tools.approval import (
-                        reset_current_session_key as _reset_current_session_key,
-                        set_current_session_key,
-                    )
+                    _set_current_session_key = resolve("set_current_session_key")
+                    _reset_current_session_key = resolve("reset_current_session_key")
 
-                    approval_token = set_current_session_key(self._approval_session_key)
+                    approval_token = _set_current_session_key(self._approval_session_key)
                     reset_current_session_key = _reset_current_session_key
                 except Exception:
                     pass
@@ -1054,9 +1053,7 @@ def _resolve_inherit_policy(policy: str) -> str:
     if policy != "inherit":
         return policy
     try:
-        from tools.approval import _get_approval_mode
-
-        mode = _get_approval_mode()
+        mode = resolve("_get_approval_mode")()
     except Exception:
         return "deny"
     return {"manual": "ask", "smart": "smart", "off": "approve"}.get(mode, "deny")
@@ -1107,7 +1104,7 @@ def _make_child_approval_callback(
     if clean == "smart":
         def _smart(command: str, description: str, **_: Any) -> str:
             try:
-                from tools.approval import _smart_approve
+                _smart_approve = resolve("_smart_approve")
             except Exception:
                 return "deny"
             try:
@@ -1163,8 +1160,9 @@ def _register_task_cwd(task_id: str, cwd: str) -> None:
 
 def _cleanup_task_cwd(task_id: str) -> None:
     try:
-        from tools.terminal_tool import cleanup_vm, clear_task_env_overrides
+        from tools.terminal_tool import clear_task_env_overrides
 
+        cleanup_vm = resolve("cleanup_vm")
         clear_task_env_overrides(task_id)
         cleanup_vm(task_id)
     except Exception:
