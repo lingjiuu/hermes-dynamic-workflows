@@ -777,15 +777,24 @@ class StructuredOutputContinuationTests(unittest.TestCase):
 
         approval_mod.set_current_session_key = set_current_session_key
         approval_mod.reset_current_session_key = reset_current_session_key
+        # since the Sep 2026 decomposition the session-key helpers live in
+        # tools.approval_context; tools.approval only re-exports them.
+        approval_ctx_mod = types.ModuleType("tools.approval_context")
+        approval_ctx_mod.set_current_session_key = set_current_session_key
+        approval_ctx_mod.reset_current_session_key = reset_current_session_key
         terminal_mod = types.ModuleType("tools.terminal_tool")
         terminal_mod.set_approval_callback = lambda callback: None
         terminal_mod.register_task_env_overrides = lambda task_id, overrides: None
         terminal_mod.clear_task_env_overrides = lambda task_id: None
-        terminal_mod.cleanup_vm = lambda task_id: None
+        # cleanup_vm moved to tools.terminal_tool_lifecycle.
+        lifecycle_mod = types.ModuleType("tools.terminal_tool_lifecycle")
+        lifecycle_mod.cleanup_vm = lambda task_id: None
         tools_pkg = types.ModuleType("tools")
         tools_pkg.__path__ = []
         tools_pkg.approval = approval_mod
+        tools_pkg.approval_context = approval_ctx_mod
         tools_pkg.terminal_tool = terminal_mod
+        tools_pkg.terminal_tool_lifecycle = lifecycle_mod
 
         class Child:
             session_prompt_tokens = 0
@@ -816,7 +825,9 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             {
                 "tools": tools_pkg,
                 "tools.approval": approval_mod,
+                "tools.approval_context": approval_ctx_mod,
                 "tools.terminal_tool": terminal_mod,
+                "tools.terminal_tool_lifecycle": lifecycle_mod,
             },
         ):
             result = runner._run_child_with_timeout(child=Child(), request=request, lease=lease, agent_type=None, toolsets=[])
@@ -1153,16 +1164,25 @@ class ChildApprovalPolicyTests(unittest.TestCase):
     def test_inherit_manual_uses_captured_cli_approval_callback(self):
         approval_mod = types.ModuleType("tools.approval")
         approval_mod._get_approval_mode = lambda: "manual"
+        # _get_approval_mode resolves through tools.approval_context since the
+        # Sep 2026 decomposition; mock both paths so the test does not depend
+        # on which module happens to be importable.
+        ctx_mod = types.ModuleType("tools.approval_context")
+        ctx_mod._get_approval_mode = lambda: "manual"
         tools_pkg = types.ModuleType("tools")
         tools_pkg.__path__ = []
         tools_pkg.approval = approval_mod
+        tools_pkg.approval_context = ctx_mod
         calls = []
 
         def interactive(command, description):
             calls.append(command)
             return "once"
 
-        with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
+        with patch.dict(
+            sys.modules,
+            {"tools": tools_pkg, "tools.approval": approval_mod, "tools.approval_context": ctx_mod},
+        ):
             cb = _make_child_approval_callback("inherit", interactive_callback=interactive)
             self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
         self.assertEqual(calls, ["rm -rf build"])
@@ -1172,20 +1192,40 @@ class ChildApprovalPolicyTests(unittest.TestCase):
         approval_mod = types.ModuleType("tools.approval")
         approval_mod._smart_approve = lambda command, description: "approve"
         approval_mod._get_approval_mode = lambda: "manual"
+        ctx_mod = types.ModuleType("tools.approval_context")
+        ctx_mod._get_approval_mode = lambda: "manual"
+        smart_mod = types.ModuleType("tools.approval_smart")
+        smart_mod._smart_approve = lambda command, description: "approve"
         tools_pkg = types.ModuleType("tools")
         tools_pkg.__path__ = []
         tools_pkg.approval = approval_mod
-        with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
+        tools_pkg.approval_context = ctx_mod
+        tools_pkg.approval_smart = smart_mod
+        with patch.dict(
+            sys.modules,
+            {
+                "tools": tools_pkg,
+                "tools.approval": approval_mod,
+                "tools.approval_context": ctx_mod,
+                "tools.approval_smart": smart_mod,
+            },
+        ):
             cb = _make_child_approval_callback("ask")
             self.assertEqual(cb("npm test", "script execution"), "once")
 
     def test_inherit_follows_hermes_mode(self):
         approval_mod = types.ModuleType("tools.approval")
         approval_mod._get_approval_mode = lambda: "off"  # off -> approve
+        ctx_mod = types.ModuleType("tools.approval_context")
+        ctx_mod._get_approval_mode = lambda: "off"  # off -> approve
         tools_pkg = types.ModuleType("tools")
         tools_pkg.__path__ = []
         tools_pkg.approval = approval_mod
-        with patch.dict(sys.modules, {"tools": tools_pkg, "tools.approval": approval_mod}):
+        tools_pkg.approval_context = ctx_mod
+        with patch.dict(
+            sys.modules,
+            {"tools": tools_pkg, "tools.approval": approval_mod, "tools.approval_context": ctx_mod},
+        ):
             cb = _make_child_approval_callback("inherit")
             self.assertEqual(cb("rm -rf build", "recursive delete"), "once")
 

@@ -225,14 +225,19 @@ class InheritResolutionTests(unittest.TestCase):
 
         appr = types.ModuleType("tools.approval")
         appr._get_approval_mode = lambda: mode
+        # mock the module that owns the symbol today as well, so the test is
+        # independent of which module the compat shim finds first.
+        appr_ctx = types.ModuleType("tools.approval_context")
+        appr_ctx._get_approval_mode = lambda: mode
         pkg = types.ModuleType("tools")
         pkg.approval = appr
+        pkg.approval_context = appr_ctx
         from hermes_dynamic_workflows.adapters.hooks import _resolve_policy
 
         class _Cfg:
             child_approval_policy = "inherit"
 
-        with patch.dict(sys.modules, {"tools": pkg, "tools.approval": appr}):
+        with patch.dict(sys.modules, {"tools": pkg, "tools.approval": appr, "tools.approval_context": appr_ctx}):
             return _resolve_policy(_Cfg())
 
     def test_inherit_maps_manual_to_ask(self):
