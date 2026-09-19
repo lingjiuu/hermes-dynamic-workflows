@@ -26,6 +26,8 @@ import shlex
 import threading
 from typing import Any, Callable
 
+from .._hermes_compat import resolve
+
 # Child task ids are minted as ``workflow-<uuid>`` by the runner.
 WORKFLOW_CHILD_PREFIX = "workflow-"
 TERMINAL_TOOLS = {"terminal"}
@@ -378,9 +380,7 @@ def _resolve_policy(cfg: Any) -> str:
     if policy != "inherit":
         return policy
     try:
-        from tools.approval import _get_approval_mode
-
-        mode = _get_approval_mode()
+        mode = resolve("_get_approval_mode")()
     except Exception:
         return "deny"  # can't read Hermes config -> safe default
     return {"manual": "ask", "smart": "smart", "off": "approve"}.get(mode, "deny")
@@ -399,9 +399,9 @@ def _has_gateway_channel() -> bool:
     try:
         from tools import approval as _approval
 
-        if not _approval._is_gateway_approval_context():
+        if not resolve("_is_gateway_approval_context")():
             return False
-        session_key = _approval.get_current_session_key()
+        session_key = resolve("get_current_session_key")()
         with _approval._lock:
             return _approval._gateway_notify_cbs.get(session_key) is not None
     except Exception:
@@ -413,9 +413,7 @@ def _make_on_allow():
     Hermes' downstream re-gating (its check_all_command_guards runs again and,
     for a detached gateway child, would otherwise re-flag the command)."""
     try:
-        from tools import approval as _approval
-
-        session_key = _approval.get_current_session_key()
+        session_key = resolve("get_current_session_key")()
     except Exception:
         return None
 
@@ -458,11 +456,9 @@ def pre_tool_call_handler(
     if _is_interactive_cli():
         return None
     try:
-        from tools.approval import (
-            _smart_approve,
-            detect_dangerous_command,
-            load_permanent_allowlist,
-        )
+        from tools.approval import detect_dangerous_command, load_permanent_allowlist
+
+        _smart_approve = resolve("_smart_approve")
     except Exception:
         return None  # can't classify -> don't risk a false block
     try:
